@@ -21,3 +21,6 @@ jobs:
       enforce: false
       fail_severity: HIGH,CRITICAL
       image_ref: ghcr.io/YOUR-ORG/YOUR-APP:${{ github.sha }}
+      # Email the finished report to this address. Leave unset to use the TIDHQ owner address.
+      report_recipient: you@example.com
+      report_name: Application Security Scan Report

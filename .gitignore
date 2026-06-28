@@ -9,3 +9,24 @@ syft
 gitleaks
 osv-scanner
 
+# Python bytecode (e.g. from scripts/test_report_email.py)
+__pycache__/
+*.pyc
+
+# Secrets and credentials — never commit. Configure these as GitHub Actions
+# secrets instead (see docs/EMAIL-SETUP.md).
+.env
+.env.*
+*.env
+secrets.*
+*.secret
+*.secrets
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+*credentials*
+*smtp*
+*token*
+

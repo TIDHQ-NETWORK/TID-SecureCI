@@ -56,10 +56,38 @@ on:
         required: false
         type: boolean
         default: true
+      report_recipient:
+        description: "Email address to send this scan's report to. Defaults to the TIDHQ owner address."
+        required: false
+        type: string
+        default: ""
+      report_name:
+        description: "Title shown on the report cover page."
+        required: false
+        type: string
+        default: "Application Security Scan Report"
     secrets:
       checkout_token:
         required: false
       semgrep_app_token:
+        required: false
+      smtp_server:
+        description: "SMTP host. When set, the summary report is emailed. For Proton use smtp.protonmail.ch."
+        required: false
+      smtp_port:
+        description: "SMTP port. Defaults to 587 (STARTTLS), as used by Proton SMTP submission."
+        required: false
+      smtp_username:
+        description: "SMTP auth username. For Proton this is your full Proton address."
+        required: false
+      smtp_password:
+        description: "SMTP password. For Proton this is the SMTP submission token."
+        required: false
+      mail_from:
+        description: "From address. For Proton this must be the address tied to the SMTP token."
+        required: false
+      report_owner:
+        description: "TIDHQ owner address. Used as the default recipient and BCC'd on every report."
         required: false
 
 permissions:
@@ -526,6 +554,8 @@ jobs:
       - infrastructure-and-images
       - sbom
     if: ${{ always() }}
+    env:
+      MAIL_ENABLED: ${{ secrets.smtp_server != '' && secrets.report_owner != '' }}
     steps:
       - name: Download scan artifacts
         uses: actions/download-artifact@v4
@@ -558,15 +588,99 @@ jobs:
           trivy_image_count=$(count_sarif artifacts/trivy-image.sarif)
           total_count=$((semgrep_count + gitleaks_count + osv_count + checkov_count + trivy_fs_count + trivy_image_count))
 
+          echo "TOTAL_FINDINGS=${total_count}" >> "${GITHUB_ENV}"
+
+          report_name="${{ inputs.report_name }}"
+          report_date="$(date -u '+%d %B %Y, %H:%M UTC')"
+          report_id="${{ github.run_id }}-${{ github.run_attempt }}"
+          trigger="${{ github.event_name }}"
+
+          echo "REPORT_NAME=${report_name}" >> "${GITHUB_ENV}"
+          echo "REPORT_ID=${report_id}" >> "${GITHUB_ENV}"
+
           cat > report/report.md <<EOF
-          # TID-SecureCI Report
+          ---------------------------------------------------------------
+                                  TIDHQ.NETWORK
+          ---------------------------------------------------------------
 
-          Repository: \`${{ needs.prepare.outputs.repository }}\`
-          Ref: \`${{ needs.prepare.outputs.ref }}\`
-          Enforce mode: \`${{ inputs.enforce }}\`
-          Severity gate: \`${{ inputs.fail_severity }}\`
+          # ${report_name}
 
-          ## Visual Flow
+          **${{ needs.prepare.outputs.repository }}**
+
+          Report ID: ${report_id}
+          Date: ${report_date}
+          Prepared by: TID-SecureCI
+          Classification: Confidential
+
+          ---------------------------------------------------------------
+
+          ## Preface
+
+          This document is an automated security assessment produced by the
+          TIDHQ.NETWORK TID-SecureCI pipeline. It consolidates the output of
+          several independent scanners into a single record for the repository
+          and revision named above. The scan was triggered by a \`${trigger}\`
+          event. Findings here are a point-in-time snapshot; authoritative,
+          line-level results live in the GitHub Security tab and in the raw
+          SARIF artifacts attached to this report.
+
+          ## Table of Contents
+
+          1. Scan Overview
+          2. Findings Snapshot
+          3. Job Status
+          4. Where To Look
+          5. Reading The Results
+          6. Scan Map
+
+          ---------------------------------------------------------------
+
+          ## 1. Scan Overview
+
+          | Field | Value |
+          | --- | --- |
+          | Repository | \`${{ needs.prepare.outputs.repository }}\` |
+          | Ref | \`${{ needs.prepare.outputs.ref }}\` |
+          | Trigger | \`${trigger}\` |
+          | Enforce mode | \`${{ inputs.enforce }}\` |
+          | Severity gate | \`${{ inputs.fail_severity }}\` |
+
+          ## 2. Findings Snapshot
+
+          | Scanner | Findings in artifact |
+          | --- | ---: |
+          | Semgrep | ${semgrep_count} |
+          | Gitleaks | ${gitleaks_count} |
+          | OSV-Scanner | ${osv_count} |
+          | Checkov | ${checkov_count} |
+          | Trivy FS | ${trivy_fs_count} |
+          | Trivy Image | ${trivy_image_count} |
+          | Total | ${total_count} |
+
+          ## 3. Job Status
+
+          | Job | Result |
+          | --- | --- |
+          | Code And Secrets | \`${{ needs.code-and-secrets.result }}\` |
+          | Dependency And Supply Chain | \`${{ needs.dependency-supply-chain.result }}\` |
+          | Infrastructure And Images | \`${{ needs.infrastructure-and-images.result }}\` |
+          | SBOM | \`${{ needs.sbom.result }}\` |
+
+          ## 4. Where To Look
+
+          1. Open **Security -> Code scanning alerts** for line-level findings.
+          2. Open **Actions -> this run -> Artifacts** for raw SARIF and SBOM downloads.
+          3. Use the SBOM artifacts for inventory, license, and supply-chain review.
+
+          ## 5. Reading The Results
+
+          - Semgrep surfaces code patterns that may lead to security issues or insecure DOM handling.
+          - Gitleaks checks for exposed credentials or tokens in git history.
+          - OSV maps lockfiles and manifests to published dependency vulnerabilities.
+          - Checkov and Trivy cover infrastructure, misconfigurations, secrets, and package risk.
+          - SBOM artifacts show what is in the build even when no alert is raised.
+
+          ## 6. Scan Map
 
           \`\`\`mermaid
           flowchart LR
@@ -583,40 +697,8 @@ jobs:
             E --> G
           \`\`\`
 
-          ## Findings Snapshot
-
-          | Scanner | Findings in artifact |
-          | --- | ---: |
-          | Semgrep | ${semgrep_count} |
-          | Gitleaks | ${gitleaks_count} |
-          | OSV-Scanner | ${osv_count} |
-          | Checkov | ${checkov_count} |
-          | Trivy FS | ${trivy_fs_count} |
-          | Trivy Image | ${trivy_image_count} |
-          | Total | ${total_count} |
-
-          ## Job Status
-
-          | Job | Result |
-          | --- | --- |
-          | Code And Secrets | \`${{ needs.code-and-secrets.result }}\` |
-          | Dependency And Supply Chain | \`${{ needs.dependency-supply-chain.result }}\` |
-          | Infrastructure And Images | \`${{ needs.infrastructure-and-images.result }}\` |
-          | SBOM | \`${{ needs.sbom.result }}\` |
-
-          ## Where To Look
-
-          1. Open **Security -> Code scanning alerts** for line-level findings.
-          2. Open **Actions -> this run -> Artifacts** for raw SARIF and SBOM downloads.
-          3. Use the SBOM artifacts for inventory, license, and supply-chain review.
-
-          ## Reading The Results
-
-          - Semgrep surfaces code patterns that may lead to security issues or insecure DOM handling.
-          - Gitleaks checks for exposed credentials or tokens in git history.
-          - OSV maps lockfiles and manifests to published dependency vulnerabilities.
-          - Checkov and Trivy cover infrastructure, misconfigurations, secrets, and package risk.
-          - SBOM artifacts show what is in the build even when no alert is raised.
+          ---------------------------------------------------------------
+          TIDHQ.NETWORK | Confidential | Report ID ${report_id}
           EOF
 
           cat > report/report.html <<EOF
@@ -625,7 +707,7 @@ jobs:
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>TID-SecureCI Report</title>
+            <title>${report_name} - TIDHQ.NETWORK</title>
             <style>
               :root {
                 color-scheme: light;
@@ -635,7 +717,6 @@ jobs:
                 --muted: #486153;
                 --line: #d6e3d7;
                 --accent: #14532d;
-                --warn: #92400e;
               }
               body {
                 margin: 0;
@@ -648,7 +729,37 @@ jobs:
                 margin: 0 auto;
                 padding: 32px 20px 48px;
               }
-              .hero, .panel {
+              .cover {
+                background: var(--accent);
+                color: #f3fbf4;
+                border-radius: 18px;
+                padding: 64px 40px;
+                margin-bottom: 18px;
+                text-align: center;
+              }
+              .brand {
+                font-size: 16px;
+                letter-spacing: 0.32em;
+                text-transform: uppercase;
+                opacity: 0.85;
+              }
+              .cover h1 {
+                font-size: 40px;
+                margin: 18px 0 8px;
+              }
+              .cover .repo {
+                font-size: 18px;
+                opacity: 0.9;
+                margin-bottom: 28px;
+              }
+              .cover .meta {
+                display: inline-block;
+                text-align: left;
+                font-size: 14px;
+                line-height: 1.9;
+                opacity: 0.92;
+              }
+              .panel {
                 background: var(--panel);
                 border: 1px solid var(--line);
                 border-radius: 18px;
@@ -656,13 +767,19 @@ jobs:
                 padding: 24px;
                 margin-bottom: 18px;
               }
-              h1, h2 {
+              h2 {
                 margin: 0 0 12px;
+                font-size: 20px;
               }
-              .sub {
-                color: var(--muted);
-                margin-bottom: 8px;
+              .sub { color: var(--muted); margin-bottom: 8px; }
+              table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+              th, td {
+                text-align: left;
+                padding: 8px 10px;
+                border-bottom: 1px solid var(--line);
+                font-size: 14px;
               }
+              td.num { text-align: right; }
               .grid {
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -681,29 +798,68 @@ jobs:
                 color: var(--muted);
                 letter-spacing: 0.08em;
               }
-              .value {
-                font-size: 28px;
-                font-weight: 700;
-                margin-top: 8px;
+              .value { font-size: 28px; font-weight: 700; margin-top: 8px; }
+              ol, ul { margin: 10px 0 0 20px; padding: 0; }
+              code { background: #eef6ed; padding: 2px 6px; border-radius: 6px; }
+              .footer {
+                text-align: center;
+                color: var(--muted);
+                font-size: 12px;
+                letter-spacing: 0.06em;
+                padding: 12px 0 0;
               }
-              ol, ul {
-                margin: 10px 0 0 20px;
-                padding: 0;
-              }
-              code {
-                background: #eef6ed;
-                padding: 2px 6px;
-                border-radius: 6px;
+              @media print {
+                .cover, .preface { page-break-after: always; }
+                .panel { page-break-inside: avoid; }
               }
             </style>
           </head>
           <body>
             <div class="wrap">
-              <section class="hero">
-                <h1>TID-SecureCI Report</h1>
-                <div class="sub">Repository: ${{ needs.prepare.outputs.repository }}</div>
-                <div class="sub">Ref: ${{ needs.prepare.outputs.ref }}</div>
-                <div class="sub">Enforce mode: ${{ inputs.enforce }} | Severity gate: ${{ inputs.fail_severity }}</div>
+              <section class="cover">
+                <div class="brand">TIDHQ.NETWORK</div>
+                <h1>${report_name}</h1>
+                <div class="repo">${{ needs.prepare.outputs.repository }}</div>
+                <div class="meta">
+                  Report ID: ${report_id}<br>
+                  Date: ${report_date}<br>
+                  Prepared by: TID-SecureCI<br>
+                  Classification: Confidential
+                </div>
+              </section>
+
+              <section class="panel preface">
+                <h2>Preface</h2>
+                <p>This document is an automated security assessment produced by the
+                TIDHQ.NETWORK TID-SecureCI pipeline. It consolidates the output of
+                several independent scanners into a single record for the repository
+                and revision shown on the cover. This scan was triggered by a
+                <code>${trigger}</code> event. Findings here are a point-in-time
+                snapshot; authoritative, line-level results live in the GitHub
+                Security tab and in the raw SARIF artifacts attached to this report.</p>
+                <p><strong>Contents:</strong></p>
+                <ol>
+                  <li>Scan Overview</li>
+                  <li>Findings Snapshot</li>
+                  <li>Job Status</li>
+                  <li>Where To Look</li>
+                  <li>Reading The Results</li>
+                </ol>
+              </section>
+
+              <section class="panel">
+                <h2>1. Scan Overview</h2>
+                <table>
+                  <tr><th>Repository</th><td>${{ needs.prepare.outputs.repository }}</td></tr>
+                  <tr><th>Ref</th><td>${{ needs.prepare.outputs.ref }}</td></tr>
+                  <tr><th>Trigger</th><td>${trigger}</td></tr>
+                  <tr><th>Enforce mode</th><td>${{ inputs.enforce }}</td></tr>
+                  <tr><th>Severity gate</th><td>${{ inputs.fail_severity }}</td></tr>
+                </table>
+              </section>
+
+              <section class="panel">
+                <h2>2. Findings Snapshot</h2>
                 <div class="grid">
                   <div class="card"><div class="label">Semgrep</div><div class="value">${semgrep_count}</div></div>
                   <div class="card"><div class="label">Gitleaks</div><div class="value">${gitleaks_count}</div></div>
@@ -713,23 +869,38 @@ jobs:
                   <div class="card"><div class="label">Total</div><div class="value">${total_count}</div></div>
                 </div>
               </section>
+
               <section class="panel">
-                <h2>How To Read This Run</h2>
+                <h2>3. Job Status</h2>
+                <table>
+                  <tr><th>Code And Secrets</th><td>${{ needs.code-and-secrets.result }}</td></tr>
+                  <tr><th>Dependency And Supply Chain</th><td>${{ needs.dependency-supply-chain.result }}</td></tr>
+                  <tr><th>Infrastructure And Images</th><td>${{ needs.infrastructure-and-images.result }}</td></tr>
+                  <tr><th>SBOM</th><td>${{ needs.sbom.result }}</td></tr>
+                </table>
+              </section>
+
+              <section class="panel">
+                <h2>4. Where To Look</h2>
                 <ol>
                   <li>Open <code>Security -&gt; Code scanning alerts</code> for line-level issues.</li>
                   <li>Open <code>Actions -&gt; this run -&gt; Artifacts</code> for SARIF and SBOM files.</li>
                   <li>Use SPDX and CycloneDX SBOM files for dependency inventory and supply-chain review.</li>
                 </ol>
               </section>
+
               <section class="panel">
-                <h2>Scanner Coverage</h2>
+                <h2>5. Reading The Results</h2>
                 <ul>
                   <li>Semgrep checks application code and custom AI/ML guardrails.</li>
                   <li>Gitleaks checks git history for secrets.</li>
                   <li>OSV checks manifests and lockfiles against vulnerability advisories.</li>
                   <li>Checkov and Trivy check infrastructure, misconfigurations, and package risk.</li>
+                  <li>SBOM artifacts show what is in the build even when no alert is raised.</li>
                 </ul>
               </section>
+
+              <div class="footer">TIDHQ.NETWORK &middot; Confidential &middot; Report ID ${report_id}</div>
             </div>
           </body>
           </html>
@@ -740,6 +911,32 @@ jobs:
         with:
           name: tid-secureci-report
           path: report/
+
+      - name: Stage email body
+        if: ${{ env.MAIL_ENABLED == 'true' }}
+        shell: bash
+        run: |
+          {
+            echo 'MAIL_HTML<<__TID_HTML__'
+            cat report/report.html
+            echo '__TID_HTML__'
+          } >> "${GITHUB_ENV}"
+
+      - name: Email report
+        if: ${{ env.MAIL_ENABLED == 'true' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.smtp_server }}
+          server_port: ${{ secrets.smtp_port || '587' }}
+          secure: ${{ (secrets.smtp_port || '587') == '465' }}
+          username: ${{ secrets.smtp_username }}
+          password: ${{ secrets.smtp_password }}
+          from: TIDHQ.NETWORK SecureCI <${{ secrets.mail_from || secrets.smtp_username }}>
+          to: ${{ inputs.report_recipient || secrets.report_owner }}
+          bcc: ${{ inputs.report_recipient != '' && secrets.report_owner || '' }}
+          subject: "TIDHQ.NETWORK | ${{ env.REPORT_NAME }} - ${{ needs.prepare.outputs.repository }} (${{ env.TOTAL_FINDINGS }} findings)"
+          html_body: ${{ env.MAIL_HTML }}
+          attachments: report/report.html,report/report.md,artifacts/*
 
       - name: Publish summary
         shell: bash

@@ -112,6 +112,7 @@ jobs:
     outputs:
       repository: ${{ steps.resolve.outputs.repository }}
       ref: ${{ steps.resolve.outputs.ref }}
+      is_self: ${{ steps.resolve.outputs.is_self }}
     steps:
       - id: resolve
         shell: bash
@@ -125,12 +126,23 @@ jobs:
             repository="${{ github.repository }}"
           fi
 
+          # Whether we are scanning the caller's own repository (self-scan) or a
+          # different/remote repository. Code-scanning SARIF uploads only work
+          # for the caller's own commits, so this gates those uploads later.
+          if [ "${repository}" = "${{ github.repository }}" ]; then
+            is_self="true"
+          else
+            is_self="false"
+          fi
+
           # Only default the ref to the caller's commit when self-scanning.
           # For a remote target the caller SHA is not a ref in that repo, so
           # leave it blank and let checkout use the target's default branch.
-          if [ -z "${ref}" ] && [ "${repository}" = "${{ github.repository }}" ]; then
+          if [ -z "${ref}" ] && [ "${is_self}" = "true" ]; then
             ref="${{ github.sha }}"
           fi
+
+          echo "is_self=${is_self}" >> "${GITHUB_OUTPUT}"
 
           echo "repository=${repository}" >> "${GITHUB_OUTPUT}"
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
@@ -299,7 +311,7 @@ jobs:
           exit "${status}"
 
       - name: Upload Semgrep SARIF
-        if: ${{ always() && inputs.enable_semgrep && hashFiles('results/semgrep.sarif') != '' }}
+        if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_semgrep && hashFiles('results/semgrep.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results/semgrep.sarif
@@ -307,7 +319,7 @@ jobs:
           checkout_path: target
 
       - name: Upload Gitleaks SARIF
-        if: ${{ always() && inputs.enable_gitleaks && hashFiles('results/gitleaks.sarif') != '' }}
+        if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_gitleaks && hashFiles('results/gitleaks.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results/gitleaks.sarif
@@ -380,7 +392,7 @@ jobs:
           exit "${status}"
 
       - name: Upload OSV SARIF
-        if: ${{ always() && inputs.enable_osv && hashFiles('results/osv.sarif') != '' }}
+        if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_osv && hashFiles('results/osv.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results/osv.sarif
@@ -482,7 +494,7 @@ jobs:
             "${{ inputs.image_ref }}"
 
       - name: Upload Checkov SARIF
-        if: ${{ always() && inputs.enable_checkov && hashFiles('results/checkov.sarif') != '' }}
+        if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_checkov && hashFiles('results/checkov.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results/checkov.sarif
@@ -490,7 +502,7 @@ jobs:
           checkout_path: target
 
       - name: Upload Trivy filesystem SARIF
-        if: ${{ always() && inputs.enable_trivy && hashFiles('results/trivy-fs.sarif') != '' }}
+        if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_trivy && hashFiles('results/trivy-fs.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results/trivy-fs.sarif
@@ -498,7 +510,7 @@ jobs:
           checkout_path: target
 
       - name: Upload Trivy image SARIF
-        if: ${{ always() && inputs.enable_trivy && hashFiles('results/trivy-image.sarif') != '' }}
+        if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_trivy && hashFiles('results/trivy-image.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results/trivy-image.sarif

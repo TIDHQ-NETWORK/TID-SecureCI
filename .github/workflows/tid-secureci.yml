@@ -659,6 +659,9 @@ jobs:
             homepage_md="[${repo_homepage}](${repo_homepage})"
             homepage_html="<a href=\"${repo_homepage}\">${repo_homepage}</a>"
           fi
+          # Human-friendly ref label (blank ref means the target's default branch)
+          ref_display="${{ needs.prepare.outputs.ref }}"
+          [ -z "${ref_display}" ] && ref_display="${repo_branch} (default branch)"
 
           html_jq='
             .runs[]?.results[]? as $r
@@ -772,7 +775,7 @@ jobs:
           | --- | --- |
           | Repository | [${{ needs.prepare.outputs.repository }}](${repo_url}) |
           | Description | ${repo_desc_md} |
-          | Ref scanned | \`${{ needs.prepare.outputs.ref }}\` |
+          | Ref scanned | \`${ref_display}\` |
           | Default branch | \`${repo_branch}\` |
           | Primary language | ${repo_lang} |
           | Topics | ${repo_topics} |
@@ -1039,7 +1042,7 @@ jobs:
                 <table>
                   <tr><th>Repository</th><td><a href="${repo_url}">${{ needs.prepare.outputs.repository }}</a></td></tr>
                   <tr><th>Description</th><td>${repo_desc_html}</td></tr>
-                  <tr><th>Ref scanned</th><td><code>${{ needs.prepare.outputs.ref }}</code></td></tr>
+                  <tr><th>Ref scanned</th><td><code>${ref_display}</code></td></tr>
                   <tr><th>Default branch</th><td><code>${repo_branch}</code></td></tr>
                   <tr><th>Primary language</th><td>${repo_lang}</td></tr>
                   <tr><th>Topics</th><td>${repo_topics_html}</td></tr>

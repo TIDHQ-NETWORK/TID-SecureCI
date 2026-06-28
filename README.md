@@ -78,6 +78,8 @@ on:
 permissions:
   contents: read
   security-events: write
+  pull-requests: write   # dependency-review job (PR events) needs this
+  actions: read          # sbom job needs this
 
 jobs:
   secureci:

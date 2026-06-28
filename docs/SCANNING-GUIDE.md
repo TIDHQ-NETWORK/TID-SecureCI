@@ -72,6 +72,8 @@ on:
 permissions:
   contents: read
   security-events: write    # required so findings can be written to the Security tab
+  pull-requests: write      # the dependency-review job (PR events) needs this
+  actions: read             # the sbom job needs this
 
 jobs:
   secureci:
@@ -285,6 +287,9 @@ severity. A finding count of `0` for a scanner can also mean "nothing to scan"
 | Authentication failed | Wrong Proton password | Use the SMTP **submission token**, not your login password |
 | "did not find lockfiles" | No manifests for OSV to read | Expected; not an error |
 | Findings not in Security tab | Missing `security-events: write` | Add it to the caller's `permissions` |
+| `startup_failure` / "nested job is requesting ... but is only allowed none" | Caller `permissions` missing a grant the reusable jobs need | Grant `pull-requests: write` and `actions: read` (plus `contents: read`, `security-events: write`) |
+| Remote scan checkout fails with `not our ref` | A `target_ref` was passed that doesn't exist in the target repo | Leave `target_ref` blank to use the target's default branch, or pass a real ref |
+| External-repo findings only by email/artifact | Code-scanning SARIF upload is skipped for repos you don't own | Expected; read the emailed report, artifacts, and run summary instead of the Security tab |
 | Can't scan another repo | No `checkout_token` | Pass a read-scoped token for the target |
 
 ## Glossary

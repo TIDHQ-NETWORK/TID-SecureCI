@@ -267,7 +267,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/bin"
-          curl -fsSL \
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             -o "${RUNNER_TEMP}/gitleaks.tar.gz"
           tar -xzf "${RUNNER_TEMP}/gitleaks.tar.gz" -C "${RUNNER_TEMP}"
@@ -345,7 +345,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/bin"
-          curl -fsSL \
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
             "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" \
             -o "${RUNNER_TEMP}/osv-scanner"
           install "${RUNNER_TEMP}/osv-scanner" "${RUNNER_TEMP}/bin/osv-scanner"
@@ -425,7 +425,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/bin"
-          curl -fsSL \
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
             "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
             -o "${RUNNER_TEMP}/trivy.tar.gz"
           tar -xzf "${RUNNER_TEMP}/trivy.tar.gz" -C "${RUNNER_TEMP}/bin" trivy

@@ -85,6 +85,21 @@ pretending to catch everything.
 > on-demand workflow that scans any public `owner/repo` you type in and emails you
 > the report.
 
+## Test it in one command
+
+Point the hosted scanner at any public repo and have the report emailed to you:
+
+```bash
+gh workflow run scan-external.yml \
+  -R TIDHQ-NETWORK/TID-SecureCI \
+  -f target_repository=OWNER/REPO \
+  -f report_recipient=you@example.com
+```
+
+No CLI? Run it from **Actions → Scan External Repo → Run workflow**. The full
+test-drive guide — including how to let **other people** run their own scans and get
+reports — is in **[docs/TRY-IT.md](docs/TRY-IT.md)**.
+
 New to this? The full walkthrough is in
 [docs/SCANNING-GUIDE.md](docs/SCANNING-GUIDE.md) — scanning your other repos,
 vetting third-party apps, reading the report, and understanding severity.

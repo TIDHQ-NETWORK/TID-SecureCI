@@ -936,7 +936,7 @@ jobs:
           bcc: ${{ inputs.report_recipient != '' && secrets.report_owner || '' }}
           subject: "TIDHQ.NETWORK | ${{ env.REPORT_NAME }} - ${{ needs.prepare.outputs.repository }} (${{ env.TOTAL_FINDINGS }} findings)"
           html_body: ${{ env.MAIL_HTML }}
-          attachments: report/report.html,report/report.md,artifacts/*
+          attachments: report/report.html,report/report.md,artifacts/*.sarif,artifacts/*.json
 
       - name: Publish summary
         shell: bash

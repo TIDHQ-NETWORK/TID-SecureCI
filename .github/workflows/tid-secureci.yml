@@ -457,9 +457,17 @@ jobs:
             --framework terraform,kubernetes,dockerfile,secrets,github_actions,helm,arm,bicep,cloudformation,sca_package \
             --download-external-modules true \
             -o sarif \
-            --output-file-path "${RESULTS_DIR}/checkov.sarif"
+            --output-file-path "${RESULTS_DIR}/checkov-out"
           status=$?
           set -e
+
+          # Checkov treats --output-file-path as a directory and writes
+          # results_sarif.sarif inside it. Flatten it to the single file path
+          # the rest of the pipeline (counts, findings, SARIF upload) expects.
+          if [ -f "${RESULTS_DIR}/checkov-out/results_sarif.sarif" ]; then
+            mv "${RESULTS_DIR}/checkov-out/results_sarif.sarif" "${RESULTS_DIR}/checkov.sarif"
+          fi
+          rm -rf "${RESULTS_DIR}/checkov-out"
 
           if [ "${status}" -ne 0 ] && [ "${{ inputs.enforce }}" != "true" ]; then
             echo "Checkov reported findings; continuing because enforce=false."
@@ -615,6 +623,71 @@ jobs:
 
           echo "TOTAL_FINDINGS=${total_count}" >> "${GITHUB_ENV}"
 
+          # ---- Detailed findings: one row per issue, with a link to review it ----
+          link_repo="${{ needs.prepare.outputs.repository }}"
+          link_ref="${{ needs.prepare.outputs.ref }}"
+          [ -z "${link_ref}" ] && link_ref="HEAD"
+
+          html_jq='
+            .runs[]?.results[]? as $r
+            | ($r.ruleId // "-") as $rule
+            | ($r.level // "warning") as $level
+            | (($r.message.text // "") | gsub("\n";" ")) as $msg
+            | ($r.locations[0].physicalLocation.artifactLocation.uri // "") as $rawuri
+            | ($r.locations[0].physicalLocation.region.startLine // 0) as $line
+            | ($rawuri | sub("^file://";"") | sub("^.*/target/";"") | sub("^target/";"")) as $path
+            | (if $path == "" then "" else ($path + (if $line > 0 then ":" + ($line|tostring) else "" end)) end) as $loc
+            | (if $kind == "osv" then "https://osv.dev/vulnerability/" + $rule
+                elif $path != "" then "https://github.com/" + $repo + "/blob/" + $ref + "/" + $path + (if $line > 0 then "#L" + ($line|tostring) else "" end)
+                else "" end) as $url
+            | "<tr><td>" + $scanner + "</td>"
+              + "<td><span class=\"sev sev-" + $level + "\">" + $level + "</span></td>"
+              + "<td><code>" + ($rule|@html) + "</code></td>"
+              + "<td>" + (if $loc == "" then "&mdash;" else ($loc|@html) end) + "</td>"
+              + "<td>" + ($msg|@html) + "</td>"
+              + "<td>" + (if $url == "" then "&mdash;" else "<a href=\"" + $url + "\">review</a>" end) + "</td></tr>"
+          '
+
+          md_jq='
+            .runs[]?.results[]? as $r
+            | ($r.ruleId // "-") as $rule
+            | ($r.level // "warning") as $level
+            | (($r.message.text // "") | gsub("\n";" ") | gsub("\\|";"\\\\|")) as $msg
+            | ($r.locations[0].physicalLocation.artifactLocation.uri // "") as $rawuri
+            | ($r.locations[0].physicalLocation.region.startLine // 0) as $line
+            | ($rawuri | sub("^file://";"") | sub("^.*/target/";"") | sub("^target/";"")) as $path
+            | (if $path == "" then "" else ($path + (if $line > 0 then ":" + ($line|tostring) else "" end)) end) as $loc
+            | (if $kind == "osv" then "https://osv.dev/vulnerability/" + $rule
+                elif $path != "" then "https://github.com/" + $repo + "/blob/" + $ref + "/" + $path + (if $line > 0 then "#L" + ($line|tostring) else "" end)
+                else "" end) as $url
+            | "| " + $scanner + " | " + $level + " | \`" + $rule + "\` | " + (if $loc == "" then " " else $loc end) + " | " + $msg + " | " + (if $url == "" then " " else ("[review](" + $url + ")") end) + " |"
+          '
+
+          : > report/findings_html.frag
+          : > report/findings_md.frag
+          gen_findings() {
+            local file="$1" label="$2" kind="$3"
+            [ -f "artifacts/${file}" ] || return 0
+            jq empty "artifacts/${file}" >/dev/null 2>&1 || return 0
+            jq -r --arg scanner "${label}" --arg kind "${kind}" --arg repo "${link_repo}" --arg ref "${link_ref}" "${html_jq}" "artifacts/${file}" >> report/findings_html.frag || true
+            jq -r --arg scanner "${label}" --arg kind "${kind}" --arg repo "${link_repo}" --arg ref "${link_ref}" "${md_jq}"   "artifacts/${file}" >> report/findings_md.frag || true
+          }
+          gen_findings semgrep.sarif     "Semgrep"     code
+          gen_findings gitleaks.sarif    "Gitleaks"    secret
+          gen_findings osv.sarif         "OSV"         osv
+          gen_findings checkov.sarif     "Checkov"     iac
+          gen_findings trivy-fs.sarif    "Trivy FS"    fs
+          gen_findings trivy-image.sarif "Trivy Image" image
+
+          if [ ! -s report/findings_html.frag ]; then
+            echo '<tr><td colspan="6">No findings were reported by any scanner.</td></tr>' > report/findings_html.frag
+          fi
+          if [ ! -s report/findings_md.frag ]; then
+            echo '| — | — | — | — | No findings were reported by any scanner. | — |' > report/findings_md.frag
+          fi
+          FINDINGS_HTML="$(cat report/findings_html.frag)"
+          FINDINGS_MD="$(cat report/findings_md.frag)"
+
           report_name="${{ inputs.report_name }}"
           report_date="$(date -u '+%d %B %Y, %H:%M UTC')"
           report_id="${{ github.run_id }}-${{ github.run_attempt }}"
@@ -653,10 +726,11 @@ jobs:
 
           1. Scan Overview
           2. Findings Snapshot
-          3. Job Status
-          4. Where To Look
-          5. Reading The Results
-          6. Scan Map
+          3. Detailed Findings
+          4. Job Status
+          5. Where To Look
+          6. Reading The Results
+          7. Scan Map
 
           ---------------------------------------------------------------
 
@@ -682,7 +756,16 @@ jobs:
           | Trivy Image | ${trivy_image_count} |
           | Total | ${total_count} |
 
-          ## 3. Job Status
+          ## 3. Detailed Findings
+
+          Every issue each scanner reported, with a link to review it in context
+          (source line on GitHub, or the advisory for a vulnerable dependency).
+
+          | Scanner | Severity | Rule | Location | Detail | Review |
+          | --- | --- | --- | --- | --- | --- |
+          ${FINDINGS_MD}
+
+          ## 4. Job Status
 
           | Job | Result |
           | --- | --- |
@@ -691,13 +774,13 @@ jobs:
           | Infrastructure And Images | \`${{ needs.infrastructure-and-images.result }}\` |
           | SBOM | \`${{ needs.sbom.result }}\` |
 
-          ## 4. Where To Look
+          ## 5. Where To Look
 
           1. Open **Security -> Code scanning alerts** for line-level findings.
           2. Open **Actions -> this run -> Artifacts** for raw SARIF and SBOM downloads.
           3. Use the SBOM artifacts for inventory, license, and supply-chain review.
 
-          ## 5. Reading The Results
+          ## 6. Reading The Results
 
           - Semgrep surfaces code patterns that may lead to security issues or insecure DOM handling.
           - Gitleaks checks for exposed credentials or tokens in git history.
@@ -705,7 +788,7 @@ jobs:
           - Checkov and Trivy cover infrastructure, misconfigurations, secrets, and package risk.
           - SBOM artifacts show what is in the build even when no alert is raised.
 
-          ## 6. Scan Map
+          ## 7. Scan Map
 
           \`\`\`mermaid
           flowchart LR
@@ -736,7 +819,7 @@ jobs:
             <style>
               :root {
                 color-scheme: light;
-                --bg: #f4f7f2;
+                --bg: #2e3338;
                 --panel: #ffffff;
                 --ink: #102418;
                 --muted: #486153;
@@ -746,7 +829,7 @@ jobs:
               body {
                 margin: 0;
                 font-family: ui-sans-serif, system-ui, sans-serif;
-                background: linear-gradient(180deg, #eef6ed 0%, var(--bg) 100%);
+                background: var(--bg);
                 color: var(--ink);
               }
               .wrap {
@@ -826,9 +909,27 @@ jobs:
               .value { font-size: 28px; font-weight: 700; margin-top: 8px; }
               ol, ul { margin: 10px 0 0 20px; padding: 0; }
               code { background: #eef6ed; padding: 2px 6px; border-radius: 6px; }
+              table.findings { font-size: 13px; }
+              table.findings td { vertical-align: top; }
+              table.findings td:nth-child(5) { color: var(--muted); }
+              .sev {
+                display: inline-block;
+                font-size: 11px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                padding: 2px 8px;
+                border-radius: 999px;
+                background: #e5e9ee;
+                color: #2e3338;
+              }
+              .sev-error { background: #fde2e1; color: #8a1c13; }
+              .sev-warning { background: #fdeccf; color: #8a5a08; }
+              .sev-note { background: #dbeafe; color: #0b4a8a; }
+              .findings a { color: var(--accent); font-weight: 600; }
               .footer {
                 text-align: center;
-                color: var(--muted);
+                color: #c3c8cc;
                 font-size: 12px;
                 letter-spacing: 0.06em;
                 padding: 12px 0 0;
@@ -866,6 +967,7 @@ jobs:
                 <ol>
                   <li>Scan Overview</li>
                   <li>Findings Snapshot</li>
+                  <li>Detailed Findings</li>
                   <li>Job Status</li>
                   <li>Where To Look</li>
                   <li>Reading The Results</li>
@@ -896,7 +998,21 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>3. Job Status</h2>
+                <h2>3. Detailed Findings</h2>
+                <p class="sub">Every issue each scanner reported, with a link to review it in
+                context &mdash; the source line on GitHub, or the advisory for a vulnerable dependency.</p>
+                <table class="findings">
+                  <thead>
+                    <tr><th>Scanner</th><th>Severity</th><th>Rule</th><th>Location</th><th>Detail</th><th>Review</th></tr>
+                  </thead>
+                  <tbody>
+                    ${FINDINGS_HTML}
+                  </tbody>
+                </table>
+              </section>
+
+              <section class="panel">
+                <h2>4. Job Status</h2>
                 <table>
                   <tr><th>Code And Secrets</th><td>${{ needs.code-and-secrets.result }}</td></tr>
                   <tr><th>Dependency And Supply Chain</th><td>${{ needs.dependency-supply-chain.result }}</td></tr>
@@ -906,7 +1022,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>4. Where To Look</h2>
+                <h2>5. Where To Look</h2>
                 <ol>
                   <li>Open <code>Security -&gt; Code scanning alerts</code> for line-level issues.</li>
                   <li>Open <code>Actions -&gt; this run -&gt; Artifacts</code> for SARIF and SBOM files.</li>
@@ -915,7 +1031,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>5. Reading The Results</h2>
+                <h2>6. Reading The Results</h2>
                 <ul>
                   <li>Semgrep checks application code and custom AI/ML guardrails.</li>
                   <li>Gitleaks checks git history for secrets.</li>

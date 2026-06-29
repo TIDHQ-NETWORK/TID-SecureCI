@@ -165,7 +165,7 @@ jobs:
           token: ${{ secrets.checkout_token || github.token }}
 
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         continue-on-error: ${{ !inputs.enforce }}
         with:
           fail-on-severity: high

@@ -567,6 +567,46 @@ jobs:
           artifact-name: tid-secureci-sbom.cdx.json
           dependency-snapshot: false
 
+  repo-posture:
+    name: Repository Posture
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+    steps:
+      - name: Run OpenSSF Scorecard
+        shell: bash
+        env:
+          # Scorecard reads its GitHub token from GITHUB_AUTH_TOKEN. The default
+          # workflow token can query any public repo; a PAT (checkout_token) is
+          # only needed for private targets.
+          GITHUB_AUTH_TOKEN: ${{ secrets.checkout_token || github.token }}
+          TARGET: ${{ needs.prepare.outputs.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          SCORECARD_VERSION="5.5.0"
+          curl -sSL -o scorecard.tar.gz \
+            "https://github.com/ossf/scorecard/releases/download/v${SCORECARD_VERSION}/scorecard_${SCORECARD_VERSION}_linux_amd64.tar.gz"
+          tar -xzf scorecard.tar.gz scorecard
+          chmod +x scorecard
+          # Best-effort: a clean public repo scores fine, but rate limits or a
+          # private/empty target must not fail the whole pipeline. Fall back to
+          # an empty object so the report can note that posture was unavailable.
+          if ! ./scorecard --repo="github.com/${TARGET}" --format=json --show-details \
+                > results/scorecard.json 2> scorecard.err; then
+            echo "Scorecard did not complete:"
+            cat scorecard.err || true
+            echo '{}' > results/scorecard.json
+          fi
+
+      - name: Upload scorecard artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tid-secureci-scorecard
+          path: results/scorecard.json
+
   summary:
     name: Summary
     runs-on: ubuntu-latest
@@ -576,6 +616,7 @@ jobs:
       - dependency-supply-chain
       - infrastructure-and-images
       - sbom
+      - repo-posture
     if: ${{ always() }}
     steps:
       - name: Determine whether email is configured
@@ -597,10 +638,41 @@ jobs:
           pattern: tid-secureci-*
           merge-multiple: true
 
+      - name: Restore previous scan metrics
+        # Rolling cache: each run saves under a unique run_id key, and the
+        # prefix restore-key pulls the most recent prior run for this target.
+        # This lets the report show a delta vs the last scan with no extra
+        # secrets or write permissions. Failures here are non-fatal.
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: .tidstate
+          key: tid-secureci-metrics-${{ needs.prepare.outputs.repository }}-${{ github.run_id }}
+          restore-keys: |
+            tid-secureci-metrics-${{ needs.prepare.outputs.repository }}-
+
       - name: Build report assets
         shell: bash
+        # All workflow context is passed in via env rather than inlined as
+        # ${{ }} in the script below. A run block that contains any ${{ }} is
+        # compiled by GitHub as a single interpolation template capped at 21000
+        # characters; this report script is larger than that, so keeping it
+        # expression-free is what lets it grow without tripping that limit.
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ needs.prepare.outputs.repository }}
+          TARGET_REF: ${{ needs.prepare.outputs.ref }}
+          REPORT_NAME_IN: ${{ inputs.report_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVENT_NAME: ${{ github.event_name }}
+          ENFORCE: ${{ inputs.enforce }}
+          FAIL_SEVERITY: ${{ inputs.fail_severity }}
+          R_CODE: ${{ needs.code-and-secrets.result }}
+          R_DEP: ${{ needs.dependency-supply-chain.result }}
+          R_INFRA: ${{ needs.infrastructure-and-images.result }}
+          R_SBOM: ${{ needs.sbom.result }}
+          R_POSTURE: ${{ needs.repo-posture.result }}
         run: |
           set -euo pipefail
 
@@ -625,9 +697,147 @@ jobs:
 
           echo "TOTAL_FINDINGS=${total_count}" >> "${GITHUB_ENV}"
 
+          # ---- Severity breakdown + risk grade --------------------------------
+          # Prefer the security-severity of each rule (a CVSS-like 0-10 score);
+          # fall back to the SARIF level when a scanner does not provide one. Emits
+          # four space-separated counts: Critical High Medium Low.
+          sev_counts() {
+            local file="$1"
+            if [ -f "${file}" ] && jq empty "${file}" >/dev/null 2>&1; then
+              jq -r '
+                [ .runs[]?
+                  | ( reduce ((.tool.driver.rules // []) + ([ .tool.extensions[]?.rules // [] ] | add // []))[] as $r
+                        ({}; . + { ($r.id // ""): ($r.properties."security-severity" // "") }) ) as $sev
+                  | .results[]?
+                  | ( (.properties."security-severity" // $sev[(.ruleId // .rule.id // "")] // "") | tostring ) as $ss
+                  | ( if ($ss | test("^[0-9]+([.][0-9]+)?$")) then ($ss | tonumber)
+                      else ( (.level // "warning") | if . == "error" then 7 elif . == "warning" then 4 else 1 end ) end ) as $score
+                  | if $score >= 9 then "C" elif $score >= 7 then "H" elif $score >= 4 then "M" else "L" end ]
+                | "\(map(select(.=="C"))|length) \(map(select(.=="H"))|length) \(map(select(.=="M"))|length) \(map(select(.=="L"))|length)"
+              ' "${file}"
+            else
+              echo "0 0 0 0"
+            fi
+          }
+
+          crit=0; high=0; med=0; low=0
+          for f in semgrep gitleaks osv checkov trivy-fs trivy-image; do
+            read -r c h m l < <(sev_counts "artifacts/${f}.sarif")
+            crit=$((crit + c)); high=$((high + h)); med=$((med + m)); low=$((low + l))
+          done
+
+          # Weighted posture score, capped by the worst severity present so a
+          # single Critical can never read as a passing grade.
+          penalty=$(( crit*25 + high*8 + med*2 + low ))
+          score=$(( 100 - penalty )); [ "${score}" -lt 0 ] && score=0
+          if [ "${crit}" -gt 0 ] && [ "${score}" -gt 40 ]; then score=40; fi
+          if [ "${high}" -gt 0 ] && [ "${score}" -gt 60 ]; then score=60; fi
+          if   [ "${score}" -ge 90 ]; then grade="A"; grade_word="Strong";   grade_class="grade-a"
+          elif [ "${score}" -ge 80 ]; then grade="B"; grade_word="Good";     grade_class="grade-b"
+          elif [ "${score}" -ge 70 ]; then grade="C"; grade_word="Fair";     grade_class="grade-c"
+          elif [ "${score}" -ge 50 ]; then grade="D"; grade_word="Weak";     grade_class="grade-d"
+          else grade="F"; grade_word="Critical"; grade_class="grade-f"; fi
+          echo "RISK_GRADE=${grade}" >> "${GITHUB_ENV}"
+
+          # ---- OpenSSF Scorecard (repository posture) -------------------------
+          scorecard_score="—"; scorecard_html=""; scorecard_md=""
+          if [ -f artifacts/scorecard.json ] && jq -e '(.score? // null) != null' artifacts/scorecard.json >/dev/null 2>&1; then
+            scorecard_score="$(jq -r '.score' artifacts/scorecard.json)"
+            scorecard_html="$(jq -r '
+              (.checks // []) | sort_by(.score // -1) | .[]
+              | "<tr><td>" + (.name|@html) + "</td>"
+                + "<td>" + (if (.score // -1) < 0 then "n/a" else ((.score|tostring) + "/10") end) + "</td>"
+                + "<td>" + ((.reason // "")|@html) + "</td></tr>"
+            ' artifacts/scorecard.json)"
+            scorecard_md="$(jq -r '
+              (.checks // []) | sort_by(.score // -1) | .[]
+              | "| " + (.name) + " | " + (if (.score // -1) < 0 then "n/a" else ((.score|tostring) + "/10") end)
+                + " | " + ((.reason // "") | gsub("\\|";"\\\\|") | gsub("\n";" ")) + " |"
+            ' artifacts/scorecard.json)"
+          fi
+          [ -z "${scorecard_html}" ] && scorecard_html='<tr><td colspan="3">Repository posture score was not available for this target.</td></tr>'
+          [ -z "${scorecard_md}" ] && scorecard_md='| — | — | Repository posture score was not available for this target. |'
+          echo "SCORECARD_SCORE=${scorecard_score}" >> "${GITHUB_ENV}"
+
+          # ---- Exploited & high-risk CVEs (CISA KEV + FIRST EPSS) -------------
+          : > cve_ids.txt
+          for f in osv trivy-fs trivy-image; do
+            [ -f "artifacts/${f}.sarif" ] || continue
+            grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' "artifacts/${f}.sarif" 2>/dev/null >> cve_ids.txt || true
+          done
+          sort -u cve_ids.txt -o cve_ids.txt
+          cve_total=$(awk 'END{print NR+0}' cve_ids.txt)
+
+          : > kev_hits.txt; : > epss.tsv
+          kev_count=0; epss_hi_count=0
+          cve_html=""; cve_md=""
+          if [ "${cve_total}" -gt 0 ]; then
+            # CISA Known Exploited Vulnerabilities catalog (best-effort).
+            curl -s --max-time 25 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json' 2>/dev/null \
+              | jq -r '.vulnerabilities[]?.cveID' 2>/dev/null | sort -u > kev_all.txt || : > kev_all.txt
+            [ -s kev_all.txt ] && comm -12 cve_ids.txt kev_all.txt > kev_hits.txt 2>/dev/null || true
+            kev_count=$(awk 'END{print NR+0}' kev_hits.txt)
+
+            # FIRST EPSS scores, queried in batches of 100 (URL length limit).
+            split -l 100 cve_ids.txt epss_chunk_ || true
+            for chunk in epss_chunk_*; do
+              [ -f "${chunk}" ] || continue
+              ids="$(paste -sd, "${chunk}")"
+              curl -s --max-time 25 "https://api.first.org/data/v1/epss?cve=${ids}" 2>/dev/null \
+                | jq -r '.data[]? | [.cve, .epss, .percentile] | @tsv' 2>/dev/null >> epss.tsv || true
+            done
+
+            # Join CVE list with KEV membership and EPSS score (single awk pass).
+            awk -v OFS='\t' '
+              FILENAME ~ /kev_hits/ { kev[$1]=1; next }
+              FILENAME ~ /epss\.tsv/ { epss[$1]=$2; next }
+              { print $1, (kev[$1] ? "yes" : "no"), (epss[$1]=="" ? "0" : epss[$1]) }
+            ' kev_hits.txt epss.tsv cve_ids.txt > rows.tsv
+
+            epss_hi_count=$(awk -F'\t' '$3+0>=0.10{n++} END{print n+0}' rows.tsv)
+
+            # Keep CVEs that are exploited (KEV) or have EPSS >= 10%, worst first.
+            cve_html="$(jq -R -s -r '
+              [ split("\n")[] | select(length>0) | split("\t") | {cve:.[0], kev:.[1], epss:(.[2]|tonumber)} ]
+              | map(select(.kev=="yes" or .epss>=0.10)) | sort_by(-(.epss)) | .[:25]
+              | map("<tr><td><a href=\"https://nvd.nist.gov/vuln/detail/" + .cve + "\"><code>" + .cve + "</code></a></td>"
+                    + "<td>" + (if .kev=="yes" then "<span class=\"sev sev-error\">KEV</span>" else "&mdash;" end) + "</td>"
+                    + "<td>" + ((.epss*100)|floor|tostring) + "%</td></tr>") | join("\n")
+            ' rows.tsv)"
+            cve_md="$(jq -R -s -r '
+              [ split("\n")[] | select(length>0) | split("\t") | {cve:.[0], kev:.[1], epss:(.[2]|tonumber)} ]
+              | map(select(.kev=="yes" or .epss>=0.10)) | sort_by(-(.epss)) | .[:25]
+              | map("| `" + .cve + "` | " + (if .kev=="yes" then "KEV" else "—" end) + " | " + ((.epss*100)|floor|tostring) + "% |") | join("\n")
+            ' rows.tsv)"
+          fi
+          [ -z "${cve_html}" ] && cve_html='<tr><td colspan="3">No exploited or high-risk CVEs were identified among the dependency and image findings.</td></tr>'
+          [ -z "${cve_md}" ] && cve_md='| — | — | No exploited or high-risk CVEs identified. |'
+
+          # ---- Trend vs the previous scan of this repository ------------------
+          delta_fmt() { if [ "$1" -gt "$2" ]; then echo "+$(( $1 - $2 ))"; elif [ "$1" -lt "$2" ]; then echo "$(( $1 - $2 ))"; else echo "no change"; fi; }
+          if [ -f .tidstate/metrics.json ] && jq empty .tidstate/metrics.json >/dev/null 2>&1; then
+            prev_total="$(jq -r '.total // 0' .tidstate/metrics.json)"
+            prev_crit="$(jq -r '.critical // 0' .tidstate/metrics.json)"
+            prev_high="$(jq -r '.high // 0' .tidstate/metrics.json)"
+            prev_when="$(jq -r '.date // ""' .tidstate/metrics.json)"
+            when_phrase=""
+            [ -n "${prev_when}" ] && when_phrase=" on ${prev_when}"
+            trend_text="Compared with the previous scan${when_phrase}: total findings ${total_count} ($(delta_fmt ${total_count} ${prev_total}) vs ${prev_total}), Critical ${crit} ($(delta_fmt ${crit} ${prev_crit})), High ${high} ($(delta_fmt ${high} ${prev_high}))."
+          else
+            trend_text="No previous scan is on record for this repository &mdash; these results are the baseline for future comparisons."
+          fi
+
+          # Persist the metrics from this scan for the next run trend comparison.
+          mkdir -p .tidstate
+          metrics_date="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          jq -n --argjson total "${total_count}" --argjson critical "${crit}" --argjson high "${high}" \
+                --argjson medium "${med}" --argjson low "${low}" --arg date "${metrics_date}" --arg run "${RUN_ID}" \
+                '{total:$total, critical:$critical, high:$high, medium:$medium, low:$low, date:$date, run:$run}' \
+                > .tidstate/metrics.json
+
           # ---- Detailed findings: one row per issue, with a link to review it ----
-          link_repo="${{ needs.prepare.outputs.repository }}"
-          link_ref="${{ needs.prepare.outputs.ref }}"
+          link_repo="${TARGET_REPO}"
+          link_ref="${TARGET_REF}"
           [ -z "${link_ref}" ] && link_ref="HEAD"
 
           # ---- Repository metadata (best-effort; public repos via the API) ----
@@ -660,7 +870,7 @@ jobs:
             homepage_html="<a href=\"${repo_homepage}\">${repo_homepage}</a>"
           fi
           # Human-friendly ref label (blank ref means the target's default branch)
-          ref_display="${{ needs.prepare.outputs.ref }}"
+          ref_display="${TARGET_REF}"
           [ -z "${ref_display}" ] && ref_display="${repo_branch} (default branch)"
 
           html_jq='
@@ -723,10 +933,10 @@ jobs:
           FINDINGS_HTML="$(cat report/findings_html.frag)"
           FINDINGS_MD="$(cat report/findings_md.frag)"
 
-          report_name="${{ inputs.report_name }}"
+          report_name="${REPORT_NAME_IN}"
           report_date="$(date -u '+%d %B %Y, %H:%M UTC')"
-          report_id="${{ github.run_id }}-${{ github.run_attempt }}"
-          trigger="${{ github.event_name }}"
+          report_id="${RUN_ID}-${RUN_ATTEMPT}"
+          trigger="${EVENT_NAME}"
 
           echo "REPORT_NAME=${report_name}" >> "${GITHUB_ENV}"
           echo "REPORT_ID=${report_id}" >> "${GITHUB_ENV}"
@@ -738,7 +948,7 @@ jobs:
 
           # ${report_name}
 
-          **${{ needs.prepare.outputs.repository }}**
+          **${TARGET_REPO}**
 
           Report ID: ${report_id}
           Date: ${report_date}
@@ -759,13 +969,16 @@ jobs:
 
           ## Table of Contents
 
-          1. Scan Overview
-          2. Findings Snapshot
-          3. Detailed Findings
-          4. Job Status
-          5. Where To Look
-          6. Reading The Results
-          7. Scan Map
+          1. Scan & Repository Overview
+          2. Risk Posture
+          3. Findings Snapshot
+          4. Exploited & High-Risk CVEs
+          5. Repository Posture (OpenSSF Scorecard)
+          6. Detailed Findings
+          7. Job Status
+          8. Where To Look
+          9. Reading The Results
+          10. Scan Map
 
           ---------------------------------------------------------------
 
@@ -773,7 +986,7 @@ jobs:
 
           | Field | Value |
           | --- | --- |
-          | Repository | [${{ needs.prepare.outputs.repository }}](${repo_url}) |
+          | Repository | [${TARGET_REPO}](${repo_url}) |
           | Description | ${repo_desc_md} |
           | Ref scanned | \`${ref_display}\` |
           | Default branch | \`${repo_branch}\` |
@@ -785,12 +998,31 @@ jobs:
           | Homepage | ${homepage_md} |
           | Last pushed | ${repo_updated} |
           | Trigger | \`${trigger}\` |
-          | Enforce mode | \`${{ inputs.enforce }}\` |
-          | Severity gate | \`${{ inputs.fail_severity }}\` |
+          | Enforce mode | \`${ENFORCE}\` |
+          | Severity gate | \`${FAIL_SEVERITY}\` |
 
           **Quick links:** [Code](${repo_url}) &middot; [Issues](${repo_url}/issues) &middot; [Pull requests](${repo_url}/pulls) &middot; [Commits](${repo_url}/commits) &middot; [Security](${repo_url}/security) &middot; [Dependency graph](${repo_url}/network/dependencies)
 
-          ## 2. Findings Snapshot
+          ## 2. Risk Posture
+
+          **Overall grade: ${grade} (${grade_word}) &mdash; posture score ${score}/100**
+
+          | Severity | Count |
+          | --- | ---: |
+          | Critical | ${crit} |
+          | High | ${high} |
+          | Medium | ${med} |
+          | Low | ${low} |
+          | Total | ${total_count} |
+
+          Severity comes from the per-rule security-severity (CVSS-like) score
+          where available, otherwise inferred from the scanner level. The grade
+          is capped by the worst severity present, so any Critical finding limits
+          the report to a failing grade regardless of volume.
+
+          **Trend:** ${trend_text}
+
+          ## 3. Findings Snapshot
 
           | Scanner | Findings in artifact |
           | --- | ---: |
@@ -802,7 +1034,28 @@ jobs:
           | Trivy Image | ${trivy_image_count} |
           | Total | ${total_count} |
 
-          ## 3. Detailed Findings
+          ## 4. Exploited & High-Risk CVEs
+
+          Of ${cve_total} unique CVEs across the dependency and image scans,
+          ${kev_count} are in the CISA Known Exploited Vulnerabilities catalog and
+          ${epss_hi_count} have an EPSS exploitation probability of 10% or higher.
+          The highest-risk are listed below (worst first, top 25).
+
+          | CVE | CISA KEV | EPSS |
+          | --- | --- | ---: |
+          ${cve_md}
+
+          ## 5. Repository Posture (OpenSSF Scorecard)
+
+          **Aggregate Scorecard: ${scorecard_score}/10.** Scores reflect repository
+          security hygiene (branch protection, dependency pinning, dangerous
+          workflows, maintenance, and more) rather than findings in the code.
+
+          | Check | Score | Reason |
+          | --- | --- | --- |
+          ${scorecard_md}
+
+          ## 6. Detailed Findings
 
           Every issue each scanner reported, with a link to review it in context
           (source line on GitHub, or the advisory for a vulnerable dependency).
@@ -811,30 +1064,32 @@ jobs:
           | --- | --- | --- | --- | --- | --- |
           ${FINDINGS_MD}
 
-          ## 4. Job Status
+          ## 7. Job Status
 
           | Job | Result |
           | --- | --- |
-          | Code And Secrets | \`${{ needs.code-and-secrets.result }}\` |
-          | Dependency And Supply Chain | \`${{ needs.dependency-supply-chain.result }}\` |
-          | Infrastructure And Images | \`${{ needs.infrastructure-and-images.result }}\` |
-          | SBOM | \`${{ needs.sbom.result }}\` |
+          | Code And Secrets | \`${R_CODE}\` |
+          | Dependency And Supply Chain | \`${R_DEP}\` |
+          | Infrastructure And Images | \`${R_INFRA}\` |
+          | SBOM | \`${R_SBOM}\` |
+          | Repository Posture | \`${R_POSTURE}\` |
 
-          ## 5. Where To Look
+          ## 8. Where To Look
 
           1. Open **Security -> Code scanning alerts** for line-level findings.
           2. Open **Actions -> this run -> Artifacts** for raw SARIF and SBOM downloads.
           3. Use the SBOM artifacts for inventory, license, and supply-chain review.
 
-          ## 6. Reading The Results
+          ## 9. Reading The Results
 
           - Semgrep surfaces code patterns that may lead to security issues or insecure DOM handling.
           - Gitleaks checks for exposed credentials or tokens in git history.
           - OSV maps lockfiles and manifests to published dependency vulnerabilities.
           - Checkov and Trivy cover infrastructure, misconfigurations, secrets, and package risk.
           - SBOM artifacts show what is in the build even when no alert is raised.
+          - The risk grade and CVE enrichment (CISA KEV, FIRST EPSS) help triage which findings to fix first.
 
-          ## 7. Scan Map
+          ## 10. Scan Map
 
           \`\`\`mermaid
           flowchart LR
@@ -990,6 +1245,32 @@ jobs:
               .sev-warning { background: #fdeccf; color: #8a5a08; }
               .sev-note { background: #dbeafe; color: #0b4a8a; }
               .findings a { color: var(--accent); font-weight: 600; }
+              .posture {
+                display: flex;
+                align-items: center;
+                gap: 18px;
+                margin-bottom: 14px;
+              }
+              .grade {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 64px;
+                height: 64px;
+                border-radius: 16px;
+                font-size: 34px;
+                font-weight: 800;
+                color: #fff;
+                flex: 0 0 auto;
+              }
+              .grade-a { background: #15803d; }
+              .grade-b { background: #4d7c0f; }
+              .grade-c { background: #a16207; }
+              .grade-d { background: #c2410c; }
+              .grade-f { background: #b91c1c; }
+              .posture .pmeta { font-size: 14px; color: var(--muted); }
+              .posture .pmeta strong { color: var(--ink); font-size: 16px; }
+              .trend { margin-top: 12px; font-size: 14px; color: var(--muted); }
               .footer {
                 text-align: center;
                 color: #c3c8cc;
@@ -1008,7 +1289,7 @@ jobs:
               <section class="cover">
                 <div class="brand">TIDHQ.NETWORK</div>
                 <h1>${report_name}</h1>
-                <div class="repo">${{ needs.prepare.outputs.repository }}</div>
+                <div class="repo">${TARGET_REPO}</div>
                 <div class="meta">
                   Report ID: ${report_id}<br>
                   Date: ${report_date}<br>
@@ -1028,8 +1309,11 @@ jobs:
                 Security tab and in the raw SARIF artifacts attached to this report.</p>
                 <p><strong>Contents:</strong></p>
                 <ol>
-                  <li>Scan Overview</li>
+                  <li>Scan &amp; Repository Overview</li>
+                  <li>Risk Posture</li>
                   <li>Findings Snapshot</li>
+                  <li>Exploited &amp; High-Risk CVEs</li>
+                  <li>Repository Posture (OpenSSF Scorecard)</li>
                   <li>Detailed Findings</li>
                   <li>Job Status</li>
                   <li>Where To Look</li>
@@ -1040,7 +1324,7 @@ jobs:
               <section class="panel">
                 <h2>1. Scan &amp; Repository Overview</h2>
                 <table>
-                  <tr><th>Repository</th><td><a href="${repo_url}">${{ needs.prepare.outputs.repository }}</a></td></tr>
+                  <tr><th>Repository</th><td><a href="${repo_url}">${TARGET_REPO}</a></td></tr>
                   <tr><th>Description</th><td>${repo_desc_html}</td></tr>
                   <tr><th>Ref scanned</th><td><code>${ref_display}</code></td></tr>
                   <tr><th>Default branch</th><td><code>${repo_branch}</code></td></tr>
@@ -1052,8 +1336,8 @@ jobs:
                   <tr><th>Homepage</th><td>${homepage_html}</td></tr>
                   <tr><th>Last pushed</th><td>${repo_updated}</td></tr>
                   <tr><th>Trigger</th><td>${trigger}</td></tr>
-                  <tr><th>Enforce mode</th><td>${{ inputs.enforce }}</td></tr>
-                  <tr><th>Severity gate</th><td>${{ inputs.fail_severity }}</td></tr>
+                  <tr><th>Enforce mode</th><td>${ENFORCE}</td></tr>
+                  <tr><th>Severity gate</th><td>${FAIL_SEVERITY}</td></tr>
                 </table>
                 <p class="sub" style="margin-top:14px;">
                   <strong>Quick links:</strong>
@@ -1067,7 +1351,24 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>2. Findings Snapshot</h2>
+                <h2>2. Risk Posture</h2>
+                <div class="posture">
+                  <span class="grade ${grade_class}">${grade}</span>
+                  <span class="pmeta"><strong>${grade_word}</strong> &mdash; posture score ${score}/100<br>
+                  Grade is capped by the worst severity present, so any Critical finding limits the report to a failing grade.</span>
+                </div>
+                <div class="grid">
+                  <div class="card"><div class="label">Critical</div><div class="value">${crit}</div></div>
+                  <div class="card"><div class="label">High</div><div class="value">${high}</div></div>
+                  <div class="card"><div class="label">Medium</div><div class="value">${med}</div></div>
+                  <div class="card"><div class="label">Low</div><div class="value">${low}</div></div>
+                  <div class="card"><div class="label">Total</div><div class="value">${total_count}</div></div>
+                </div>
+                <p class="trend"><strong>Trend:</strong> ${trend_text}</p>
+              </section>
+
+              <section class="panel">
+                <h2>3. Findings Snapshot</h2>
                 <div class="grid">
                   <div class="card"><div class="label">Semgrep</div><div class="value">${semgrep_count}</div></div>
                   <div class="card"><div class="label">Gitleaks</div><div class="value">${gitleaks_count}</div></div>
@@ -1079,7 +1380,38 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>3. Detailed Findings</h2>
+                <h2>4. Exploited &amp; High-Risk CVEs</h2>
+                <p class="sub">Of ${cve_total} unique CVEs across the dependency and image scans,
+                <strong>${kev_count}</strong> are in the CISA Known Exploited Vulnerabilities catalog and
+                <strong>${epss_hi_count}</strong> have an EPSS exploitation probability of 10% or higher.
+                Highest-risk first (top 25).</p>
+                <div class="table-scroll">
+                  <table class="findings">
+                    <thead><tr><th>CVE</th><th>CISA KEV</th><th>EPSS</th></tr></thead>
+                    <tbody>
+                      ${cve_html}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="panel">
+                <h2>5. Repository Posture (OpenSSF Scorecard)</h2>
+                <p class="sub">Aggregate Scorecard: <strong>${scorecard_score}/10</strong>. These checks
+                reflect repository security hygiene &mdash; branch protection, dependency pinning,
+                dangerous workflows, maintenance &mdash; rather than findings in the code.</p>
+                <div class="table-scroll">
+                  <table class="findings">
+                    <thead><tr><th>Check</th><th>Score</th><th>Reason</th></tr></thead>
+                    <tbody>
+                      ${scorecard_html}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="panel">
+                <h2>6. Detailed Findings</h2>
                 <p class="sub">Every issue each scanner reported, with a link to review it in
                 context &mdash; the source line on GitHub, or the advisory for a vulnerable dependency.</p>
                 <div class="table-scroll">
@@ -1095,17 +1427,18 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>4. Job Status</h2>
+                <h2>7. Job Status</h2>
                 <table>
-                  <tr><th>Code And Secrets</th><td>${{ needs.code-and-secrets.result }}</td></tr>
-                  <tr><th>Dependency And Supply Chain</th><td>${{ needs.dependency-supply-chain.result }}</td></tr>
-                  <tr><th>Infrastructure And Images</th><td>${{ needs.infrastructure-and-images.result }}</td></tr>
-                  <tr><th>SBOM</th><td>${{ needs.sbom.result }}</td></tr>
+                  <tr><th>Code And Secrets</th><td>${R_CODE}</td></tr>
+                  <tr><th>Dependency And Supply Chain</th><td>${R_DEP}</td></tr>
+                  <tr><th>Infrastructure And Images</th><td>${R_INFRA}</td></tr>
+                  <tr><th>SBOM</th><td>${R_SBOM}</td></tr>
+                  <tr><th>Repository Posture</th><td>${R_POSTURE}</td></tr>
                 </table>
               </section>
 
               <section class="panel">
-                <h2>5. Where To Look</h2>
+                <h2>8. Where To Look</h2>
                 <ol>
                   <li>Open <code>Security -&gt; Code scanning alerts</code> for line-level issues.</li>
                   <li>Open <code>Actions -&gt; this run -&gt; Artifacts</code> for SARIF and SBOM files.</li>
@@ -1114,13 +1447,14 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>6. Reading The Results</h2>
+                <h2>9. Reading The Results</h2>
                 <ul>
                   <li>Semgrep checks application code and custom AI/ML guardrails.</li>
                   <li>Gitleaks checks git history for secrets.</li>
                   <li>OSV checks manifests and lockfiles against vulnerability advisories.</li>
                   <li>Checkov and Trivy check infrastructure, misconfigurations, and package risk.</li>
                   <li>SBOM artifacts show what is in the build even when no alert is raised.</li>
+                  <li>The risk grade and CVE enrichment (CISA KEV, FIRST EPSS) help triage what to fix first.</li>
                 </ul>
               </section>
 
@@ -1148,7 +1482,7 @@ jobs:
           from: TIDHQ.NETWORK SecureCI <${{ secrets.mail_from || secrets.smtp_username }}>
           to: ${{ inputs.report_recipient || secrets.report_owner }}
           bcc: ${{ inputs.report_recipient != '' && secrets.report_owner || '' }}
-          subject: "TIDHQ.NETWORK | ${{ env.REPORT_NAME }} - ${{ needs.prepare.outputs.repository }} (${{ env.TOTAL_FINDINGS }} findings)"
+          subject: "TIDHQ.NETWORK | ${{ env.REPORT_NAME }} - ${{ needs.prepare.outputs.repository }} (Grade ${{ env.RISK_GRADE }}, ${{ env.TOTAL_FINDINGS }} findings)"
           # Read the body from a file rather than inlining it. Passing the full
           # report HTML through an env var trips the 128 KB per-string exec limit
           # (MAX_ARG_STRLEN) on larger reports, which failed the send entirely.

@@ -1136,16 +1136,6 @@ jobs:
           name: tid-secureci-report
           path: report/
 
-      - name: Stage email body
-        if: ${{ env.MAIL_ENABLED == 'true' }}
-        shell: bash
-        run: |
-          {
-            echo 'MAIL_HTML<<__TID_HTML__'
-            cat report/report.html
-            echo '__TID_HTML__'
-          } >> "${GITHUB_ENV}"
-
       - name: Email report
         if: ${{ env.MAIL_ENABLED == 'true' }}
         uses: dawidd6/action-send-mail@v3
@@ -1159,7 +1149,10 @@ jobs:
           to: ${{ inputs.report_recipient || secrets.report_owner }}
           bcc: ${{ inputs.report_recipient != '' && secrets.report_owner || '' }}
           subject: "TIDHQ.NETWORK | ${{ env.REPORT_NAME }} - ${{ needs.prepare.outputs.repository }} (${{ env.TOTAL_FINDINGS }} findings)"
-          html_body: ${{ env.MAIL_HTML }}
+          # Read the body from a file rather than inlining it. Passing the full
+          # report HTML through an env var trips the 128 KB per-string exec limit
+          # (MAX_ARG_STRLEN) on larger reports, which failed the send entirely.
+          html_body: file://report/report.html
           attachments: report/report.html,report/report.md
 
       - name: Publish summary

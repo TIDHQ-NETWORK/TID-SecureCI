@@ -643,7 +643,7 @@ jobs:
         # prefix restore-key pulls the most recent prior run for this target.
         # This lets the report show a delta vs the last scan with no extra
         # secrets or write permissions. Failures here are non-fatal.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         continue-on-error: true
         with:
           path: .tidstate

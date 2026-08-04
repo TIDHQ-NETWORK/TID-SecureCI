@@ -312,7 +312,7 @@ jobs:
 
       - name: Upload Semgrep SARIF
         if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_semgrep && hashFiles('results/semgrep.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: results/semgrep.sarif
           category: semgrep
@@ -320,7 +320,7 @@ jobs:
 
       - name: Upload Gitleaks SARIF
         if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_gitleaks && hashFiles('results/gitleaks.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: results/gitleaks.sarif
           category: gitleaks
@@ -393,7 +393,7 @@ jobs:
 
       - name: Upload OSV SARIF
         if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_osv && hashFiles('results/osv.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: results/osv.sarif
           category: osv-scanner
@@ -503,7 +503,7 @@ jobs:
 
       - name: Upload Checkov SARIF
         if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_checkov && hashFiles('results/checkov.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: results/checkov.sarif
           category: checkov
@@ -511,7 +511,7 @@ jobs:
 
       - name: Upload Trivy filesystem SARIF
         if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_trivy && hashFiles('results/trivy-fs.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: results/trivy-fs.sarif
           category: trivy-fs
@@ -519,7 +519,7 @@ jobs:
 
       - name: Upload Trivy image SARIF
         if: ${{ always() && needs.prepare.outputs.is_self == 'true' && inputs.enable_trivy && hashFiles('results/trivy-image.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: results/trivy-image.sarif
           category: trivy-image

@@ -78,12 +78,18 @@ gh run download "$RUN" -R TIDHQ-NETWORK/TID-SecureCI
 
 When it finishes you get:
 
-- 📧 an **emailed report** (branded HTML + Markdown) covering the repository and its
-  code — language mix, size, code volume by file type, dependency and infrastructure
-  signals, commit activity and governance files — plus a **Scan Coverage** table
-  showing what each scanner ran against, the risk grade and severity breakdown, KEV
-  and EPSS enrichment, the OpenSSF Scorecard, and a Detailed Findings table with raw
-  scanner output attached;
+- 📧 an **emailed report** (branded HTML + Markdown) containing:
+  - **Repository & Code Profile** — language mix, size, code volume by file type,
+    dependency and infrastructure signals, commit activity, governance files;
+  - **Risk Posture** — grade and severity breakdown over *deduplicated* findings
+    (OSV and Trivy both resolve dependency CVEs, so raw counts double-count);
+  - **Fix This First** — every finding with a published fix, ordered by real-world
+    risk: CISA KEV first, then EPSS probability, then severity;
+  - **Scan Coverage** — per scanner, whether it ran and what it examined;
+  - **Software Bill of Materials** — package count, ecosystems, and licence mix
+    with undeclared and copyleft licences called out;
+  - OpenSSF Scorecard, KEV/EPSS enrichment, and a Detailed Findings table, with
+    raw scanner output attached;
 - 📦 **artifacts** on the run — `tid-secureci-report` (HTML/Markdown) plus the raw
   SARIF and SBOM files;
 - 📊 a **findings table** on the run's Summary page.

@@ -923,38 +923,102 @@ jobs:
           checkov_count=$(count_sarif artifacts/checkov.sarif)
           trivy_fs_count=$(count_sarif artifacts/trivy-fs.sarif)
           trivy_image_count=$(count_sarif artifacts/trivy-image.sarif)
-          total_count=$((semgrep_count + gitleaks_count + osv_count + checkov_count + trivy_fs_count + trivy_image_count))
+          raw_count=$((semgrep_count + gitleaks_count + osv_count + checkov_count + trivy_fs_count + trivy_image_count))
+
+          # ---- Normalize every scanner into one deduplicated finding set ------
+          # OSV and Trivy both resolve dependency CVEs, so summing per-scanner
+          # counts reports the same vulnerability several times over. That
+          # inflated the headline total AND the grade penalty, which is weighted
+          # per finding. Reduce every SARIF result to a common record, then
+          # collapse on a stable key: one CVE in one package is one finding no
+          # matter how many scanners saw it, and one secret at one line is one
+          # secret however many commits it appears in.
+          cat > norm.jq <<'JQPROG'
+          .runs[]? as $run
+          | ( reduce (($run.tool.driver.rules // []) + ([ $run.tool.extensions[]?.rules // [] ] | add // []))[] as $r
+                ({}; . + { ($r.id // ""): $r }) ) as $rules
+          | $run.results[]?
+          | . as $res
+          | ($res.ruleId // $res.rule.id // "-") as $rule
+          | ($rules[$rule] // {}) as $rd
+          | (($res.message.text // "") | gsub("\r"; "")) as $raw
+          | ($raw | gsub("[\n\t]"; " ") | .[0:400]) as $msg
+          | ($res.level // $rd.defaultConfiguration.level // "warning") as $level
+          | ((($res.properties // {})."security-severity" // ($rd.properties // {})."security-severity" // "") | tostring) as $ss
+          | (if ($ss | test("^[0-9]+([.][0-9]+)?$")) then ($ss | tonumber)
+             else (if $level == "error" then 7 elif $level == "warning" then 4 else 1 end) end) as $score
+          | ($res.locations[0].physicalLocation.artifactLocation.uri // "") as $rawuri
+          | ($res.locations[0].physicalLocation.region.startLine // 0) as $line
+          | ($rawuri | sub("^file://"; "") | sub("^.*/target/"; "") | sub("^target/"; "")) as $path
+          # Trivy names the package and both versions on labelled message lines.
+          | (([$raw | capture("Package:[ \t]*(?<v>[^\n]+)")] | .[0].v // "") | gsub("^\\s+|\\s+$"; "")) as $tpkg
+          | (([$raw | capture("Installed Version:[ \t]*(?<v>[^\n]+)")] | .[0].v // "") | gsub("^\\s+|\\s+$"; "")) as $tinst
+          | (([$raw | capture("Fixed Version:[ \t]*(?<v>[^\n]+)")] | .[0].v // "") | gsub("^\\s+|\\s+$"; "")) as $tfix
+          # OSV states them inline: Package 'name@version' is vulnerable to 'ID'.
+          | ([$raw | capture("Package '(?<p>[^@']+)@(?<v>[^']*)'")] | .[0]) as $ocap
+          # ...and lists the fixes in a markdown table in the rule help text.
+          | (($rd.help.text // "") | split("### Fixed Versions") | if length > 1 then .[1] else "" end) as $fixblock
+          | ([ $fixblock | split("\n")[]
+               | select(startswith("|"))
+               | split("|") | map(gsub("^\\s+|\\s+$"; ""))
+               | select(length >= 5)
+               | select((.[1] | test("^-*$")) | not)
+               | select(.[1] != "Vulnerability ID")
+               | .[3] ] | .[0] // "") as $ofix
+          | (if $tpkg != "" then $tpkg else ($ocap.p // "") end) as $pkg
+          | (if $tinst != "" then $tinst else ($ocap.v // "") end) as $installed
+          | (if $tfix != "" then $tfix else $ofix end) as $fixed
+          | (if ($rule | test("^CVE-[0-9]")) then $rule
+             else (([$msg | capture("(?<c>CVE-[0-9]{4}-[0-9]{4,})")] | .[0].c) // "") end) as $cve
+          | (if ($pkg != "" and $installed != "") then "vuln" else $kind end) as $ftype
+          | (if ($ftype == "vuln" and $cve != "" and $pkg != "")
+             then "dep:" + $cve + ":" + ($pkg | ascii_downcase)
+             elif ($ftype == "vuln" and $cve != "")
+             then "dep:" + $cve
+             else $scanner + ":" + $rule + ":" + $path + ":" + ($line | tostring) end) as $key
+          | { key: $key, scanner: $scanner, kind: $kind, ftype: $ftype, rule: $rule,
+              level: $level, score: $score, path: $path, line: $line, msg: $msg,
+              pkg: $pkg, installed: $installed, fixed: $fixed, cve: $cve }
+          JQPROG
+
+          : > findings.ndjson
+          normalize() {
+            local file="$1" label="$2" kind="$3"
+            [ -f "artifacts/${file}" ] || return 0
+            jq empty "artifacts/${file}" >/dev/null 2>&1 || return 0
+            jq -c --arg scanner "${label}" --arg kind "${kind}" -f norm.jq "artifacts/${file}" \
+              >> findings.ndjson 2>/dev/null || true
+          }
+          normalize semgrep.sarif     "Semgrep"     code
+          normalize gitleaks.sarif    "Gitleaks"    secret
+          normalize osv.sarif         "OSV"         osv
+          normalize checkov.sarif     "Checkov"     iac
+          normalize trivy-fs.sarif    "Trivy FS"    fs
+          normalize trivy-image.sarif "Trivy Image" image
+
+          # Keep the richest record of each duplicate group: prefer one that
+          # carries a fixed version, then the highest severity.
+          jq -s -c '
+            group_by(.key)
+            | map( (sort_by([(if .fixed != "" then 1 else 0 end), .score]) | last)
+                   + { scanners: (map(.scanner) | unique | join(", ")), dupes: length } )
+          ' findings.ndjson > unique.json
+
+          total_count=$(jq 'length' unique.json)
+          dupes_removed=$(( raw_count - total_count ))
+          [ "${dupes_removed}" -lt 0 ] && dupes_removed=0
 
           echo "TOTAL_FINDINGS=${total_count}" >> "${GITHUB_ENV}"
 
           # ---- Severity breakdown + risk grade --------------------------------
-          # Prefer the security-severity of each rule (a CVSS-like 0-10 score);
-          # fall back to the SARIF level when a scanner does not provide one. Emits
-          # four space-separated counts: Critical High Medium Low.
-          sev_counts() {
-            local file="$1"
-            if [ -f "${file}" ] && jq empty "${file}" >/dev/null 2>&1; then
-              jq -r '
-                [ .runs[]?
-                  | ( reduce ((.tool.driver.rules // []) + ([ .tool.extensions[]?.rules // [] ] | add // []))[] as $r
-                        ({}; . + { ($r.id // ""): ($r.properties."security-severity" // "") }) ) as $sev
-                  | .results[]?
-                  | ( (.properties."security-severity" // $sev[(.ruleId // .rule.id // "")] // "") | tostring ) as $ss
-                  | ( if ($ss | test("^[0-9]+([.][0-9]+)?$")) then ($ss | tonumber)
-                      else ( (.level // "warning") | if . == "error" then 7 elif . == "warning" then 4 else 1 end ) end ) as $score
-                  | if $score >= 9 then "C" elif $score >= 7 then "H" elif $score >= 4 then "M" else "L" end ]
-                | "\(map(select(.=="C"))|length) \(map(select(.=="H"))|length) \(map(select(.=="M"))|length) \(map(select(.=="L"))|length)"
-              ' "${file}"
-            else
-              echo "0 0 0 0"
-            fi
-          }
-
-          crit=0; high=0; med=0; low=0
-          for f in semgrep gitleaks osv checkov trivy-fs trivy-image; do
-            read -r c h m l < <(sev_counts "artifacts/${f}.sarif")
-            crit=$((crit + c)); high=$((high + h)); med=$((med + m)); low=$((low + l))
-          done
+          # Severity is the per-rule security-severity (a CVSS-like 0-10 score)
+          # where the scanner supplies one, otherwise inferred from the SARIF
+          # level. Counted over unique findings, so the grade is not punished
+          # twice for one vulnerability.
+          crit=$(jq '[.[] | select(.score >= 9)] | length' unique.json)
+          high=$(jq '[.[] | select(.score >= 7 and .score < 9)] | length' unique.json)
+          med=$(jq '[.[] | select(.score >= 4 and .score < 7)] | length' unique.json)
+          low=$(jq '[.[] | select(.score < 4)] | length' unique.json)
 
           # Weighted posture score, capped by the worst severity present so a
           # single Critical can never read as a passing grade.
@@ -1024,12 +1088,8 @@ jobs:
           echo "SCORECARD_SCORE=${scorecard_score}" >> "${GITHUB_ENV}"
 
           # ---- Exploited & high-risk CVEs (CISA KEV + FIRST EPSS) -------------
-          : > cve_ids.txt
-          for f in osv trivy-fs trivy-image; do
-            [ -f "artifacts/${f}.sarif" ] || continue
-            grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' "artifacts/${f}.sarif" 2>/dev/null >> cve_ids.txt || true
-          done
-          sort -u cve_ids.txt -o cve_ids.txt
+          # Taken from the deduplicated set, so each CVE is looked up once.
+          jq -r '.[] | select(.cve != "") | .cve' unique.json | sort -u > cve_ids.txt
           cve_total=$(awk 'END{print NR+0}' cve_ids.txt)
 
           : > kev_hits.txt; : > epss.tsv
@@ -1076,6 +1136,94 @@ jobs:
           fi
           [ -z "${cve_html}" ] && cve_html='<tr><td colspan="3">No exploited or high-risk CVEs were identified among the dependency and image findings.</td></tr>'
           [ -z "${cve_md}" ] && cve_md='| — | — | No exploited or high-risk CVEs identified. |'
+
+          # ---- Fix This First -------------------------------------------------
+          # The findings that have a published fix, ordered by real-world risk:
+          # actively exploited (CISA KEV) first, then by EPSS probability, then
+          # by severity. This is the remediation queue - what to bump, to what.
+          risk_json='{}'
+          if [ -s rows.tsv ]; then
+            risk_json="$(jq -R -s -c '
+              split("\n") | map(select(length > 0) | split("\t"))
+              | map({ (.[0]): { kev: (.[1] == "yes"), epss: (.[2] | tonumber) } })
+              | add // {}' rows.tsv)"
+          fi
+
+          fixable_count=$(jq '[.[] | select(.fixed != "" and .pkg != "")] | length' unique.json)
+
+          fix_jq='
+            [ .[] | select(.fixed != "" and .pkg != "")
+              | . + { kev: ($risk[.cve].kev // false), epss: ($risk[.cve].epss // 0) } ]
+            | sort_by([ (if .kev then 0 else 1 end), -(.epss), -(.score) ])
+            | .[:25]
+          '
+          fix_html="$(jq -r --argjson risk "${risk_json}" "${fix_jq}"'
+            | map("<tr><td><code>" + (.pkg|@html) + "</code></td>"
+                  + "<td>" + ((if .installed == "" then "&mdash;" else .installed end)|@html) + "</td>"
+                  + "<td><strong>" + (.fixed|@html) + "</strong></td>"
+                  + "<td>" + (if .cve == "" then (.rule|@html)
+                              else "<a href=\"https://nvd.nist.gov/vuln/detail/" + .cve + "\"><code>" + .cve + "</code></a>" end) + "</td>"
+                  + "<td>" + (.score|tostring) + "</td>"
+                  + "<td>" + (if .kev then "<span class=\"sev sev-error\">KEV</span>" else "&mdash;" end) + "</td>"
+                  + "<td>" + ((.epss*100)|floor|tostring) + "%</td></tr>")
+            | join("\n")' unique.json)"
+          fix_md="$(jq -r --argjson risk "${risk_json}" "${fix_jq}"'
+            | map("| `" + .pkg + "` | " + (if .installed == "" then " " else .installed end)
+                  + " | **" + .fixed + "** | " + (if .cve == "" then .rule else ("`" + .cve + "`") end)
+                  + " | " + (.score|tostring) + " | " + (if .kev then "KEV" else "—" end)
+                  + " | " + ((.epss*100)|floor|tostring) + "% |")
+            | join("\n")' unique.json)"
+          [ -z "${fix_html}" ] && fix_html='<tr><td colspan="7">No finding in this scan has a published fixed version to upgrade to.</td></tr>'
+          [ -z "${fix_md}" ] && fix_md='| — | — | — | — | — | — | No finding has a published fixed version. |'
+
+          # ---- Software Bill of Materials -------------------------------------
+          # The SBOM job already writes SPDX and CycloneDX inventories and they
+          # land in this job's artifacts. Read them rather than only shipping
+          # them: package count, ecosystems, and the licence mix are the part of
+          # a third-party review that findings alone never answer.
+          sbom_src=""
+          for cand in artifacts/tid-secureci-sbom.cdx.json artifacts/tid-secureci-sbom.spdx.json; do
+            if [ -f "${cand}" ] && jq -e '(.components? // .packages?) != null' "${cand}" >/dev/null 2>&1; then
+              sbom_src="${cand}"
+              break
+            fi
+          done
+
+          sbom_total=0; sbom_undeclared=0; sbom_copyleft=0
+          sbom_eco_html=""; sbom_eco_md=""; sbom_lic_html=""; sbom_lic_md=""
+          if [ -n "${sbom_src}" ]; then
+            cat > sbom.jq <<'JQPROG'
+          ( if has("components")
+            then [ .components[]? | select((.type // "") != "operating-system")
+                   | { eco: ((.purl // "") | if startswith("pkg:") then (split("/")[0] | ltrimstr("pkg:")) else "unknown" end),
+                       lics: ( [ (.licenses // [])[] | (.license.id // .license.name // .expression // empty) ]
+                               | map(select(. != null and . != "")) | unique ) } ]
+            else [ .packages[]?
+                   | { eco: ( [ (.externalRefs // [])[] | select(.referenceType == "purl") | .referenceLocator ] | .[0] // ""
+                              | if startswith("pkg:") then (split("/")[0] | ltrimstr("pkg:")) else "unknown" end),
+                       lics: ( [ (.licenseConcluded // ""), (.licenseDeclared // "") ]
+                               | map(select(. != "" and . != "NOASSERTION" and . != "NONE")) | unique ) } ]
+            end ) as $pkgs
+          | { total: ($pkgs | length),
+              undeclared: ($pkgs | map(select((.lics | length) == 0)) | length),
+              copyleft: ($pkgs | map(select(.lics | any(test("GPL|AGPL|LGPL|MPL|EPL|CDDL|SSPL|OSL"; "i")))) | length),
+              ecosystems: ($pkgs | group_by(.eco) | map({ name: .[0].eco, count: length }) | sort_by(-.count) | .[:10]),
+              licenses: ($pkgs | map(if (.lics | length) == 0 then ["not declared"] else .lics end)
+                         | add // [] | group_by(.) | map({ name: .[0], count: length }) | sort_by(-.count) | .[:12]) }
+          JQPROG
+            jq -f sbom.jq "${sbom_src}" > sbom.json 2>/dev/null || echo '{}' > sbom.json
+            sbom_total=$(jq -r '.total // 0' sbom.json)
+            sbom_undeclared=$(jq -r '.undeclared // 0' sbom.json)
+            sbom_copyleft=$(jq -r '.copyleft // 0' sbom.json)
+            sbom_eco_html="$(jq -r '(.ecosystems // []) | map("<tr><td>" + (.name|@html) + "</td><td>" + (.count|tostring) + "</td></tr>") | join("\n")' sbom.json)"
+            sbom_eco_md="$(jq -r '(.ecosystems // []) | map("| " + .name + " | " + (.count|tostring) + " |") | join("\n")' sbom.json)"
+            sbom_lic_html="$(jq -r '(.licenses // []) | map("<tr><td>" + (.name|@html) + "</td><td>" + (.count|tostring) + "</td></tr>") | join("\n")' sbom.json)"
+            sbom_lic_md="$(jq -r '(.licenses // []) | map("| " + (.name | gsub("\\|"; "\\\\|")) + " | " + (.count|tostring) + " |") | join("\n")' sbom.json)"
+          fi
+          [ -z "${sbom_eco_html}" ] && sbom_eco_html='<tr><td colspan="2">No SBOM was available for this scan.</td></tr>'
+          [ -z "${sbom_eco_md}" ] && sbom_eco_md='| — | No SBOM was available for this scan. |'
+          [ -z "${sbom_lic_html}" ] && sbom_lic_html='<tr><td colspan="2">No licence information was available.</td></tr>'
+          [ -z "${sbom_lic_md}" ] && sbom_lic_md='| — | No licence information was available. |'
 
           # ---- Trend vs the previous scan of this repository ------------------
           delta_fmt() { if [ "$1" -gt "$2" ]; then echo "+$(( $1 - $2 ))"; elif [ "$1" -lt "$2" ]; then echo "$(( $1 - $2 ))"; else echo "no change"; fi; }
@@ -1278,56 +1426,32 @@ jobs:
           COVERAGE_HTML="$(cat report/coverage_html.frag)"
           COVERAGE_MD="$(cat report/coverage_md.frag)"
 
-          html_jq='
-            .runs[]?.results[]? as $r
-            | ($r.ruleId // "-") as $rule
-            | ($r.level // "warning") as $level
-            | (($r.message.text // "") | gsub("\n";" ")) as $msg
-            | ($r.locations[0].physicalLocation.artifactLocation.uri // "") as $rawuri
-            | ($r.locations[0].physicalLocation.region.startLine // 0) as $line
-            | ($rawuri | sub("^file://";"") | sub("^.*/target/";"") | sub("^target/";"")) as $path
-            | (if $path == "" then "" else ($path + (if $line > 0 then ":" + ($line|tostring) else "" end)) end) as $loc
-            | (if $kind == "osv" then "https://osv.dev/vulnerability/" + $rule
-                elif $path != "" then "https://github.com/" + $repo + "/blob/" + $ref + "/" + $path + (if $line > 0 then "#L" + ($line|tostring) else "" end)
+          # Detailed findings come from the deduplicated set, worst severity
+          # first, and name every scanner that reported each one.
+          detail_jq='
+            sort_by([-(.score), .scanner, .path])
+            | .[]
+            | (if .path == "" then "" else (.path + (if .line > 0 then ":" + (.line|tostring) else "" end)) end) as $loc
+            | (if .kind == "osv" then "https://osv.dev/vulnerability/" + .rule
+                elif .path != "" then "https://github.com/" + $repo + "/blob/" + $ref + "/" + .path + (if .line > 0 then "#L" + (.line|tostring) else "" end)
                 else "" end) as $url
-            | "<tr><td>" + $scanner + "</td>"
-              + "<td><span class=\"sev sev-" + $level + "\">" + $level + "</span></td>"
-              + "<td><code>" + ($rule|@html) + "</code></td>"
+            | (.scanners + (if .dupes > 1 then " (x" + (.dupes|tostring) + ")" else "" end)) as $who
+          '
+
+          jq -r --arg repo "${link_repo}" --arg ref "${link_ref}" "${detail_jq}"'
+            | "<tr><td>" + ($who|@html) + "</td>"
+              + "<td><span class=\"sev sev-" + .level + "\">" + .level + "</span></td>"
+              + "<td><code>" + (.rule|@html) + "</code></td>"
               + "<td>" + (if $loc == "" then "&mdash;" else ($loc|@html) end) + "</td>"
-              + "<td>" + ($msg|@html) + "</td>"
+              + "<td>" + (.msg|@html) + "</td>"
               + "<td>" + (if $url == "" then "&mdash;" else "<a href=\"" + $url + "\">review</a>" end) + "</td></tr>"
-          '
+          ' unique.json > report/findings_html.frag || : > report/findings_html.frag
 
-          md_jq='
-            .runs[]?.results[]? as $r
-            | ($r.ruleId // "-") as $rule
-            | ($r.level // "warning") as $level
-            | (($r.message.text // "") | gsub("\n";" ") | gsub("\\|";"\\\\|")) as $msg
-            | ($r.locations[0].physicalLocation.artifactLocation.uri // "") as $rawuri
-            | ($r.locations[0].physicalLocation.region.startLine // 0) as $line
-            | ($rawuri | sub("^file://";"") | sub("^.*/target/";"") | sub("^target/";"")) as $path
-            | (if $path == "" then "" else ($path + (if $line > 0 then ":" + ($line|tostring) else "" end)) end) as $loc
-            | (if $kind == "osv" then "https://osv.dev/vulnerability/" + $rule
-                elif $path != "" then "https://github.com/" + $repo + "/blob/" + $ref + "/" + $path + (if $line > 0 then "#L" + ($line|tostring) else "" end)
-                else "" end) as $url
-            | "| " + $scanner + " | " + $level + " | `" + $rule + "` | " + (if $loc == "" then " " else $loc end) + " | " + $msg + " | " + (if $url == "" then " " else ("[review](" + $url + ")") end) + " |"
-          '
-
-          : > report/findings_html.frag
-          : > report/findings_md.frag
-          gen_findings() {
-            local file="$1" label="$2" kind="$3"
-            [ -f "artifacts/${file}" ] || return 0
-            jq empty "artifacts/${file}" >/dev/null 2>&1 || return 0
-            jq -r --arg scanner "${label}" --arg kind "${kind}" --arg repo "${link_repo}" --arg ref "${link_ref}" "${html_jq}" "artifacts/${file}" >> report/findings_html.frag || true
-            jq -r --arg scanner "${label}" --arg kind "${kind}" --arg repo "${link_repo}" --arg ref "${link_ref}" "${md_jq}"   "artifacts/${file}" >> report/findings_md.frag || true
-          }
-          gen_findings semgrep.sarif     "Semgrep"     code
-          gen_findings gitleaks.sarif    "Gitleaks"    secret
-          gen_findings osv.sarif         "OSV"         osv
-          gen_findings checkov.sarif     "Checkov"     iac
-          gen_findings trivy-fs.sarif    "Trivy FS"    fs
-          gen_findings trivy-image.sarif "Trivy Image" image
+          jq -r --arg repo "${link_repo}" --arg ref "${link_ref}" "${detail_jq}"'
+            | "| " + $who + " | " + .level + " | `" + .rule + "` | "
+              + (if $loc == "" then " " else $loc end) + " | " + (.msg | gsub("\\|"; "\\\\|"))
+              + " | " + (if $url == "" then " " else ("[review](" + $url + ")") end) + " |"
+          ' unique.json > report/findings_md.frag || : > report/findings_md.frag
 
           if [ ! -s report/findings_html.frag ]; then
             echo '<tr><td colspan="6">No findings were reported by any scanner.</td></tr>' > report/findings_html.frag
@@ -1379,15 +1503,17 @@ jobs:
           1. Scan & Repository Overview
           2. Repository & Code Profile
           3. Risk Posture
-          4. Scan Coverage
-          5. Findings Snapshot
-          6. Exploited & High-Risk CVEs
-          7. Repository Posture (OpenSSF Scorecard)
-          8. Detailed Findings
-          9. Job Status
-          10. Where To Look
-          11. Reading The Results
-          12. Scan Map
+          4. Fix This First
+          5. Scan Coverage
+          6. Findings Snapshot
+          7. Exploited & High-Risk CVEs
+          8. Software Bill of Materials
+          9. Repository Posture (OpenSSF Scorecard)
+          10. Detailed Findings
+          11. Job Status
+          12. Where To Look
+          13. Reading The Results
+          14. Scan Map
 
           ---------------------------------------------------------------
 
@@ -1483,9 +1609,25 @@ jobs:
           is capped by the worst severity present, so any Critical finding limits
           the report to a failing grade regardless of volume.
 
+          Counts are over **unique** findings. The scanners overlap &mdash; OSV and
+          Trivy both resolve dependency CVEs, and one secret appears once per
+          commit that carries it &mdash; so ${raw_count} raw results were collapsed
+          to ${total_count} distinct issues (${dupes_removed} duplicates removed).
+
           **Trend:** ${trend_text}
 
-          ## 4. Scan Coverage
+          ## 4. Fix This First
+
+          ${fixable_count} of the ${total_count} findings have a published fixed
+          version. They are ordered by real-world risk: actively exploited (CISA
+          KEV) first, then by EPSS exploitation probability, then by severity.
+          Top 25 shown.
+
+          | Package | Installed | Fixed in | Advisory | Severity | KEV | EPSS |
+          | --- | --- | --- | --- | ---: | --- | ---: |
+          ${fix_md}
+
+          ## 5. Scan Coverage
 
           Every scanner, whether it ran, and what it had in front of it. A zero in
           the Findings column means one of three different things &mdash; the
@@ -1496,7 +1638,7 @@ jobs:
           | --- | --- | ---: | --- |
           ${COVERAGE_MD}
 
-          ## 5. Findings Snapshot
+          ## 6. Findings Snapshot
 
           | Scanner | Findings in artifact |
           | --- | ---: |
@@ -1506,9 +1648,13 @@ jobs:
           | Checkov | ${checkov_count} |
           | Trivy FS | ${trivy_fs_count} |
           | Trivy Image | ${trivy_image_count} |
-          | Total | ${total_count} |
+          | Raw total | ${raw_count} |
+          | **Unique findings** | **${total_count}** |
 
-          ## 6. Exploited & High-Risk CVEs
+          Per-scanner counts are raw artifact contents. The unique total is what
+          the risk grade is calculated from.
+
+          ## 7. Exploited & High-Risk CVEs
 
           Of ${cve_total} unique CVEs across the dependency and image scans,
           ${kev_count} are in the CISA Known Exploited Vulnerabilities catalog and
@@ -1519,7 +1665,24 @@ jobs:
           | --- | --- | ---: |
           ${cve_md}
 
-          ## 7. Repository Posture (OpenSSF Scorecard)
+          ## 8. Software Bill of Materials
+
+          The SBOM records what this software is actually made of, independent of
+          whether any scanner raised an alert. **${sbom_total} packages** were
+          catalogued: ${sbom_undeclared} declare no licence and ${sbom_copyleft}
+          carry a copyleft licence (GPL, AGPL, LGPL, MPL and similar) &mdash; both
+          are worth review before adopting or redistributing this code. Full SPDX
+          and CycloneDX files are attached to the run.
+
+          | Ecosystem | Packages |
+          | --- | ---: |
+          ${sbom_eco_md}
+
+          | Licence | Packages |
+          | --- | ---: |
+          ${sbom_lic_md}
+
+          ## 9. Repository Posture (OpenSSF Scorecard)
 
           **Aggregate Scorecard: ${scorecard_score}/10.** Scores reflect repository
           security hygiene (branch protection, dependency pinning, dangerous
@@ -1529,7 +1692,7 @@ jobs:
           | --- | --- | --- |
           ${scorecard_md}
 
-          ## 8. Detailed Findings
+          ## 10. Detailed Findings
 
           Every issue each scanner reported, with a link to review it in context
           (source line on GitHub, or the advisory for a vulnerable dependency).
@@ -1538,7 +1701,7 @@ jobs:
           | --- | --- | --- | --- | --- | --- |
           ${FINDINGS_MD}
 
-          ## 9. Job Status
+          ## 11. Job Status
 
           | Job | Result |
           | --- | --- |
@@ -1548,13 +1711,13 @@ jobs:
           | SBOM | \`${R_SBOM}\` |
           | Repository Posture | \`${R_POSTURE}\` |
 
-          ## 10. Where To Look
+          ## 12. Where To Look
 
           1. Open **Security -> Code scanning alerts** for line-level findings.
           2. Open **Actions -> this run -> Artifacts** for raw SARIF and SBOM downloads.
           3. Use the SBOM artifacts for inventory, license, and supply-chain review.
 
-          ## 11. Reading The Results
+          ## 13. Reading The Results
 
           - Semgrep surfaces code patterns that may lead to security issues or insecure DOM handling.
           - Gitleaks checks for exposed credentials or tokens in git history.
@@ -1563,7 +1726,7 @@ jobs:
           - SBOM artifacts show what is in the build even when no alert is raised.
           - The risk grade and CVE enrichment (CISA KEV, FIRST EPSS) help triage which findings to fix first.
 
-          ## 12. Scan Map
+          ## 14. Scan Map
 
           \`\`\`mermaid
           flowchart LR
@@ -1704,6 +1867,10 @@ jobs:
               table.findings th:nth-child(4), table.findings td:nth-child(4) { width: 16%; }
               table.findings th:nth-child(5), table.findings td:nth-child(5) { width: 35%; color: var(--muted); }
               table.findings th:nth-child(6), table.findings td:nth-child(6) { width: 9%; }
+              /* The remediation table has seven columns of its own proportions,
+                 so it opts out of the six-column widths above. */
+              table.fixtable { table-layout: auto; }
+              table.fixtable th, table.fixtable td { width: auto !important; color: inherit !important; }
               .sev {
                 display: inline-block;
                 font-size: 11px;
@@ -1799,9 +1966,11 @@ jobs:
                   <li>Scan &amp; Repository Overview</li>
                   <li>Repository &amp; Code Profile</li>
                   <li>Risk Posture</li>
+                  <li>Fix This First</li>
                   <li>Scan Coverage</li>
                   <li>Findings Snapshot</li>
                   <li>Exploited &amp; High-Risk CVEs</li>
+                  <li>Software Bill of Materials</li>
                   <li>Repository Posture (OpenSSF Scorecard)</li>
                   <li>Detailed Findings</li>
                   <li>Job Status</li>
@@ -1921,11 +2090,30 @@ jobs:
                   <div class="card"><div class="label">Low</div><div class="value">${low}</div></div>
                   <div class="card"><div class="label">Total</div><div class="value">${total_count}</div></div>
                 </div>
+                <p class="trend">Counts are over <strong>unique</strong> findings. The scanners
+                overlap &mdash; OSV and Trivy both resolve dependency CVEs, and one secret appears
+                once per commit that carries it &mdash; so ${raw_count} raw results were collapsed
+                to ${total_count} distinct issues (${dupes_removed} duplicates removed).</p>
                 <p class="trend"><strong>Trend:</strong> ${trend_text}</p>
               </section>
 
               <section class="panel">
-                <h2>4. Scan Coverage</h2>
+                <h2>4. Fix This First</h2>
+                <p class="sub">${fixable_count} of the ${total_count} findings have a published
+                fixed version. Ordered by real-world risk: actively exploited (CISA KEV) first,
+                then by EPSS exploitation probability, then by severity. Top 25.</p>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>Package</th><th>Installed</th><th>Fixed in</th><th>Advisory</th><th>Severity</th><th>KEV</th><th>EPSS</th></tr></thead>
+                    <tbody>
+                      ${fix_html}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="panel">
+                <h2>5. Scan Coverage</h2>
                 <p class="sub">Every scanner, whether it ran, and what it had in front of it.
                 A zero in Findings means one of three different things &mdash; the scanner ran and
                 found nothing, it had nothing of its kind to look at, or it never ran. This table
@@ -1941,19 +2129,22 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>5. Findings Snapshot</h2>
+                <h2>6. Findings Snapshot</h2>
                 <div class="grid">
                   <div class="card"><div class="label">Semgrep</div><div class="value">${semgrep_count}</div></div>
                   <div class="card"><div class="label">Gitleaks</div><div class="value">${gitleaks_count}</div></div>
                   <div class="card"><div class="label">OSV</div><div class="value">${osv_count}</div></div>
                   <div class="card"><div class="label">Checkov</div><div class="value">${checkov_count}</div></div>
                   <div class="card"><div class="label">Trivy FS</div><div class="value">${trivy_fs_count}</div></div>
-                  <div class="card"><div class="label">Total</div><div class="value">${total_count}</div></div>
+                  <div class="card"><div class="label">Raw total</div><div class="value">${raw_count}</div></div>
+                  <div class="card"><div class="label">Unique</div><div class="value">${total_count}</div></div>
                 </div>
+                <p class="sub" style="margin-top:14px;">Per-scanner counts are raw artifact
+                contents. The unique total is what the risk grade is calculated from.</p>
               </section>
 
               <section class="panel">
-                <h2>6. Exploited &amp; High-Risk CVEs</h2>
+                <h2>7. Exploited &amp; High-Risk CVEs</h2>
                 <p class="sub">Of ${cve_total} unique CVEs across the dependency and image scans,
                 <strong>${kev_count}</strong> are in the CISA Known Exploited Vulnerabilities catalog and
                 <strong>${epss_hi_count}</strong> have an EPSS exploitation probability of 10% or higher.
@@ -1969,7 +2160,41 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>7. Repository Posture (OpenSSF Scorecard)</h2>
+                <h2>8. Software Bill of Materials</h2>
+                <p class="sub">What this software is made of, independent of whether any scanner
+                raised an alert. Full SPDX and CycloneDX files are attached to the run.</p>
+                <div class="grid">
+                  <div class="card"><div class="label">Packages</div><div class="value">${sbom_total}</div></div>
+                  <div class="card"><div class="label">No licence declared</div><div class="value">${sbom_undeclared}</div></div>
+                  <div class="card"><div class="label">Copyleft</div><div class="value">${sbom_copyleft}</div></div>
+                </div>
+                <p class="sub" style="margin-top:14px;">Undeclared and copyleft (GPL, AGPL, LGPL,
+                MPL and similar) licences are both worth review before adopting or redistributing
+                this code.</p>
+
+                <div class="subhead">Packages by ecosystem</div>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>Ecosystem</th><th>Packages</th></tr></thead>
+                    <tbody>
+                      ${sbom_eco_html}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="subhead">Licence mix</div>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>Licence</th><th>Packages</th></tr></thead>
+                    <tbody>
+                      ${sbom_lic_html}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="panel">
+                <h2>9. Repository Posture (OpenSSF Scorecard)</h2>
                 <p class="sub">Aggregate Scorecard: <strong>${scorecard_score}/10</strong>. These checks
                 reflect repository security hygiene &mdash; branch protection, dependency pinning,
                 dangerous workflows, maintenance &mdash; rather than findings in the code.</p>
@@ -1984,7 +2209,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>8. Detailed Findings</h2>
+                <h2>10. Detailed Findings</h2>
                 <p class="sub">Every issue each scanner reported, with a link to review it in
                 context &mdash; the source line on GitHub, or the advisory for a vulnerable dependency.</p>
                 <div class="table-scroll">
@@ -2000,7 +2225,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>9. Job Status</h2>
+                <h2>11. Job Status</h2>
                 <table>
                   <tr><th>Code And Secrets</th><td>${R_CODE}</td></tr>
                   <tr><th>Dependency And Supply Chain</th><td>${R_DEP}</td></tr>
@@ -2011,7 +2236,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>10. Where To Look</h2>
+                <h2>12. Where To Look</h2>
                 <ol>
                   <li>Open <code>Security -&gt; Code scanning alerts</code> for line-level issues.</li>
                   <li>Open <code>Actions -&gt; this run -&gt; Artifacts</code> for SARIF and SBOM files.</li>
@@ -2020,7 +2245,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>11. Reading The Results</h2>
+                <h2>13. Reading The Results</h2>
                 <ul>
                   <li>Semgrep checks application code and custom AI/ML guardrails.</li>
                   <li>Gitleaks checks git history for secrets.</li>

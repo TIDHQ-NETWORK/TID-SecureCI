@@ -668,7 +668,17 @@ jobs:
           GH_TOKEN: ${{ secrets.checkout_token || github.token }}
           TARGET: ${{ needs.prepare.outputs.repository }}
         run: |
-          set -uo pipefail
+          # GitHub invokes `shell: bash` as `bash -e -o pipefail`, so -e is
+          # already on before this script runs and `set -uo pipefail` does not
+          # clear it. This step is full of `... | head -n N` probes: head exits
+          # early, the writer upstream takes SIGPIPE, pipefail propagates the
+          # failure and -e killed the whole step before inventory.json was ever
+          # written - which silently emptied the profile sections of the report.
+          # Profiling is best effort and must never fail a scan, so disable both
+          # explicitly here. Every value below has a defined fallback.
+          set +e
+          set +o pipefail
+          set -u
 
           mkdir -p results
           echo '{}' > results/inventory.json
@@ -1483,8 +1493,11 @@ jobs:
           # and every field below would then render twice.
           repo_json='{}'
           if [ -n "${link_repo}" ]; then
+            # The trailing `|| true` matters: this step runs under -e with
+            # pipefail, so a 404 from gh (private target, rate limit) would
+            # otherwise fail the assignment and abort the entire report.
             repo_json="$(gh api "repos/${link_repo}" 2>/dev/null \
-              | jq -c -s '(.[0] // {}) | if (type == "object" and (has("message") | not)) then . else {} end' 2>/dev/null)"
+              | jq -c -s '(.[0] // {}) | if (type == "object" and (has("message") | not)) then . else {} end' 2>/dev/null || true)"
             [ -z "${repo_json}" ] && repo_json='{}'
           fi
           rj() { printf '%s' "${repo_json}" | jq -r "$1" 2>/dev/null; }
@@ -1525,7 +1538,8 @@ jobs:
             have_inv="true"
           fi
 
-          iv() { jq -r "$1" "${inv}" 2>/dev/null; }
+          # Never let a jq hiccup abort the report: this step runs under -e.
+          iv() { jq -r "$1" "${inv}" 2>/dev/null || true; }
           prof_files=0; prof_dirs=0; prof_size="—"; prof_text=0; prof_lines=0
           prof_dep=0; prof_infra=0; prof_workflows=0; prof_tests=0
           prof_commits=0; prof_contributors=0; prof_active=0
@@ -1590,26 +1604,91 @@ jobs:
               | join("\n")')"
           fi
 
-          [ -z "${lang_html}" ] && lang_html='<tr><td colspan="2">Language breakdown was not available for this target.</td></tr>'
-          [ -z "${lang_md}" ] && lang_md='| — | Language breakdown was not available. |'
-          [ -z "${ext_html}" ] && ext_html='<tr><td colspan="3">No text files were profiled for this target.</td></tr>'
-          [ -z "${ext_md}" ] && ext_md='| — | — | No text files were profiled. |'
-          [ -z "${signal_html}" ] && signal_html='<tr><td colspan="3">No dependency manifests or infrastructure files were detected in this repository.</td></tr>'
-          [ -z "${signal_md}" ] && signal_md='| — | — | No dependency manifests or infrastructure files detected. |'
-          [ -z "${gov_html}" ] && gov_html='<tr><td colspan="2">Repository governance files could not be inspected.</td></tr>'
-          [ -z "${gov_md}" ] && gov_md='| — | Repository governance files could not be inspected. |'
+          # Same rule as the code overview: an empty fragment removes the
+          # subsection rather than printing a table with an apology in it.
+          sub_lang_md=""; sub_lang_html=""
+          if [ -n "${lang_md}" ]; then
+            sub_lang_md="
+          ### Language mix
+
+          | Language | Share |
+          | --- | ---: |
+          ${lang_md}
+          "
+            sub_lang_html="
+          <div class=\"subhead\">Language mix</div>
+          <div class=\"table-scroll\"><table class=\"findings\">
+          <thead><tr><th>Language</th><th>Share</th></tr></thead>
+          <tbody>
+          ${lang_html}
+          </tbody></table></div>"
+          fi
+
+          sub_ext_md=""; sub_ext_html=""
+          if [ -n "${ext_md}" ]; then
+            sub_ext_md="
+          ### Code by file type (top 12 by lines)
+
+          | Extension | Files | Lines |
+          | --- | ---: | ---: |
+          ${ext_md}
+          "
+            sub_ext_html="
+          <div class=\"subhead\">Code by file type (top 12 by lines)</div>
+          <div class=\"table-scroll\"><table class=\"findings\">
+          <thead><tr><th>Extension</th><th>Files</th><th>Lines</th></tr></thead>
+          <tbody>
+          ${ext_html}
+          </tbody></table></div>"
+          fi
+
+          sub_signal_md=""; sub_signal_html=""
+          if [ -n "${signal_md}" ]; then
+            sub_signal_md="
+          ### Dependency & infrastructure signals
+
+          | Signal | Kind | Files |
+          | --- | --- | ---: |
+          ${signal_md}
+          "
+            sub_signal_html="
+          <div class=\"subhead\">Dependency &amp; infrastructure signals</div>
+          <div class=\"table-scroll\"><table class=\"findings\">
+          <thead><tr><th>Signal</th><th>Kind</th><th>Files</th></tr></thead>
+          <tbody>
+          ${signal_html}
+          </tbody></table></div>"
+          fi
+
+          sub_gov_md=""; sub_gov_html=""
+          if [ -n "${gov_md}" ]; then
+            sub_gov_md="
+          ### Governance files
+
+          | File | Status |
+          | --- | --- |
+          ${gov_md}
+          "
+            sub_gov_html="
+          <div class=\"subhead\">Governance files</div>
+          <div class=\"table-scroll\"><table class=\"findings\">
+          <thead><tr><th>File</th><th>Status</th></tr></thead>
+          <tbody>
+          ${gov_html}
+          </tbody></table></div>"
+          fi
 
           # ---- Code overview: what the repository IS --------------------------
-          ov_kind="Repository contents were not available to profile"
-          ov_readme=""; ov_readme_raw=""; ov_readme_file=""; ov_frameworks="—"
+          ov_kind=""
+          ov_readme=""; ov_readme_raw=""; ov_readme_file=""; ov_frameworks=""
           ov_dirs_html=""; ov_dirs_md=""; ov_entry_html=""; ov_entry_md=""
           ov_cmds_html=""; ov_cmds_md=""; ov_big_html=""; ov_big_md=""
           if [ "${have_inv}" = "true" ] && jq -e '.overview? != null' "${inv}" >/dev/null 2>&1; then
-            ov_kind="$(iv '(.overview.kind | select(length>0)) // "—"')"
+            ov_kind="$(iv '((.overview.kind | select(length>0)) // "") | if length > 0 then . + "." else "" end')"
             ov_readme="$(iv '((.overview.readme | select(length>0)) // "") | @html')"
             ov_readme_raw="$(iv '((.overview.readme | select(length>0)) // "")')"
             ov_readme_file="$(iv '(.overview.readme_file | select(length>0)) // ""')"
-            ov_frameworks="$(iv '((.overview.frameworks // []) | join(", ")) | if length > 0 then . else "none identified from the dependency manifests" end')"
+            ov_frameworks="$(iv '(.overview.frameworks // []) | join(", ")')"
 
             ov_dirs_html="$(iv '(.overview.dirs // [])
               | map("<tr><td><code>" + (.path|@html) + "</code></td><td>" + (if .role == "" then "&mdash;" else (.role|@html) end)
@@ -1633,26 +1712,18 @@ jobs:
             ov_big_md="$(iv '(.overview.biggest // [])
               | map("| `" + .path + "` | " + (.lines|tostring) + " |") | join("\n")')"
           fi
-          [ -z "${ov_frameworks}" ] && ov_frameworks="—"
-          [ -z "${ov_dirs_html}" ] && ov_dirs_html='<tr><td colspan="4">The repository layout could not be inspected.</td></tr>'
-          [ -z "${ov_dirs_md}" ] && ov_dirs_md='| — | — | — | The repository layout could not be inspected. |'
-          [ -z "${ov_entry_html}" ] && ov_entry_html='<tr><td colspan="2">No entry point was identified &mdash; this looks like a library or a collection of files rather than a runnable application.</td></tr>'
-          [ -z "${ov_entry_md}" ] && ov_entry_md='| — | No entry point identified — likely a library rather than a runnable application. |'
-          [ -z "${ov_cmds_html}" ] && ov_cmds_html='<tr><td colspan="2">No build or test commands were discovered.</td></tr>'
-          [ -z "${ov_cmds_md}" ] && ov_cmds_md='| — | No build or test commands were discovered. |'
-          [ -z "${ov_big_html}" ] && ov_big_html='<tr><td colspan="2">No source files were profiled.</td></tr>'
-          [ -z "${ov_big_md}" ] && ov_big_md='| — | No source files were profiled. |'
+          # No fallback rows here on purpose: an empty fragment makes the
+          # subsection that would have contained it disappear entirely, rather
+          # than printing a heading and a table whose only row is an apology.
 
           # README prose is quoted from the target repository. It is escaped and
           # never interpreted, so nothing in a scanned repo can style the report.
+          ov_readme_html=""; ov_readme_md=""
           if [ -n "${ov_readme}" ]; then
             ov_readme_html="<blockquote class=\"quoted\">${ov_readme}</blockquote><p class=\"sub\">Quoted from <code>${ov_readme_file}</code> in the target repository.</p>"
             ov_readme_md="> ${ov_readme_raw}
 
           Quoted from \`${ov_readme_file}\` in the target repository."
-          else
-            ov_readme_html='<p class="sub">No README prose was found in this repository.</p>'
-            ov_readme_md="No README prose was found in this repository."
           fi
 
           # ---- Scan coverage: what each scanner actually had to work with -----
@@ -1750,6 +1821,348 @@ jobs:
           FINDINGS_HTML="$(cat report/findings_html.frag)"
           FINDINGS_MD="$(cat report/findings_md.frag)"
 
+          # ---- Assemble the optional sections --------------------------------
+          # A section with nothing in it is removed, not rendered as an empty
+          # table with an apology inside. Section numbers are therefore assigned
+          # at build time rather than hard-coded, and the contents list is built
+          # from the same pass so the two can never drift.
+          have_sbom="false"
+          [ -n "${sbom_src}" ] && [ "${sbom_total}" -gt 0 ] && have_sbom="true"
+          have_score="false"
+          [ "${scorecard_score}" != "—" ] && have_score="true"
+
+          ov_struct_md=""; ov_struct_html=""
+          if [ -n "${ov_dirs_md}" ]; then
+            ov_struct_md="
+          ### Repository structure
+
+          | Path | Role | Files | Lines |
+          | --- | --- | ---: | ---: |
+          ${ov_dirs_md}
+          "
+            ov_struct_html="
+          <div class=\"subhead\">Repository structure</div>
+          <div class=\"table-scroll\"><table class=\"findings fixtable\">
+          <thead><tr><th>Path</th><th>Role</th><th>Files</th><th>Lines</th></tr></thead>
+          <tbody>
+          ${ov_dirs_html}
+          </tbody></table></div>"
+          fi
+
+          ov_entry_block_md=""; ov_entry_block_html=""
+          if [ -n "${ov_entry_md}" ]; then
+            ov_entry_block_md="
+          ### Entry points and network surface
+
+          Where execution starts and where the code listens. These are the places
+          untrusted input reaches this software first.
+
+          | Kind | Detail |
+          | --- | --- |
+          ${ov_entry_md}
+          "
+            ov_entry_block_html="
+          <div class=\"subhead\">Entry points and network surface</div>
+          <p class=\"sub\">Where execution starts and where the code listens &mdash; the places
+          untrusted input reaches this software first.</p>
+          <div class=\"table-scroll\"><table class=\"findings fixtable\">
+          <thead><tr><th>Kind</th><th>Detail</th></tr></thead>
+          <tbody>
+          ${ov_entry_html}
+          </tbody></table></div>"
+          fi
+
+          ov_cmds_block_md=""; ov_cmds_block_html=""
+          if [ -n "${ov_cmds_md}" ]; then
+            ov_cmds_block_md="
+          ### How it is built and run
+
+          | Command | Source |
+          | --- | --- |
+          ${ov_cmds_md}
+          "
+            ov_cmds_block_html="
+          <div class=\"subhead\">How it is built and run</div>
+          <div class=\"table-scroll\"><table class=\"findings fixtable\">
+          <thead><tr><th>Command</th><th>Source</th></tr></thead>
+          <tbody>
+          ${ov_cmds_html}
+          </tbody></table></div>"
+          fi
+
+          ov_big_block_md=""; ov_big_block_html=""
+          if [ -n "${ov_big_md}" ]; then
+            ov_big_block_md="
+          ### Where the complexity lives
+
+          The largest source files, excluding vendored, generated and minified
+          code. Concentrated complexity is where defects and review effort go.
+
+          | File | Lines |
+          | --- | ---: |
+          ${ov_big_md}
+          "
+            ov_big_block_html="
+          <div class=\"subhead\">Where the complexity lives</div>
+          <p class=\"sub\">The largest source files, excluding vendored, generated and minified
+          code. Concentrated complexity is where defects and review effort go.</p>
+          <div class=\"table-scroll\"><table class=\"findings fixtable\">
+          <thead><tr><th>File</th><th>Lines</th></tr></thead>
+          <tbody>
+          ${ov_big_html}
+          </tbody></table></div>"
+          fi
+
+          ov_fw_md=""; ov_fw_html=""
+          if [ -n "${ov_frameworks}" ]; then
+            ov_fw_md="
+          ### Frameworks and libraries in use
+
+          ${ov_frameworks}
+
+          Read from the declared dependencies in the manifests, not from prose,
+          so the names are what the project actually pulls in.
+          "
+            ov_fw_html="
+          <div class=\"subhead\">Frameworks and libraries in use</div>
+          <p class=\"sub\">${ov_frameworks}</p>
+          <p class=\"sub\">Read from the declared dependencies in the manifests, not from
+          prose, so the names are what the project actually pulls in.</p>"
+          fi
+
+          # ---- Number the sections that survived ------------------------------
+          sec_n=0
+          : > toc_md.frag
+          : > toc_html.frag
+          sec() {
+            sec_n=$((sec_n + 1))
+            SEC="${sec_n}"
+            printf '%s. %s\n' "${sec_n}" "$1" >> toc_md.frag
+            if [ "${2:-both}" != "md" ]; then
+              printf '<li>%s</li>\n' "$(printf '%s' "$1" | sed 's/&/\&amp;/g')" >> toc_html.frag
+            fi
+          }
+
+          sec "Scan & Repository Overview";  n_overview="${SEC}"
+          n_code=""; n_profile=""
+          if [ "${have_inv}" = "true" ]; then
+            sec "What This Code Is";         n_code="${SEC}"
+            sec "Repository & Code Profile"; n_profile="${SEC}"
+          fi
+          sec "Risk Posture";                n_risk="${SEC}"
+          sec "Fix This First";              n_fix="${SEC}"
+          sec "Scan Coverage";               n_cov="${SEC}"
+          sec "Findings Snapshot";           n_snap="${SEC}"
+          sec "Exploited & High-Risk CVEs";  n_cve="${SEC}"
+          n_sbom=""
+          if [ "${have_sbom}" = "true" ]; then
+            sec "Software Bill of Materials"; n_sbom="${SEC}"
+          fi
+          n_score=""
+          if [ "${have_score}" = "true" ]; then
+            sec "Repository Posture (OpenSSF Scorecard)"; n_score="${SEC}"
+          fi
+          sec "Detailed Findings";           n_detail="${SEC}"
+          sec "Job Status";                  n_jobs="${SEC}"
+          sec "Where To Look";               n_look="${SEC}"
+          sec "Reading The Results";         n_read="${SEC}"
+          sec "Scan Map" md;                 n_map="${SEC}"
+          TOC_MD="$(cat toc_md.frag)"
+          TOC_HTML="$(cat toc_html.frag)"
+
+          sec_code_md=""; sec_code_html=""
+          sec_profile_md=""; sec_profile_html=""
+          if [ "${have_inv}" = "true" ]; then
+            sec_code_md="$(cat <<XEOF
+          ## ${n_code}. What This Code Is
+
+          **${ov_kind}**
+
+          ${ov_readme_md}
+          ${ov_fw_md}${ov_struct_md}${ov_entry_block_md}${ov_cmds_block_md}${ov_big_block_md}
+          XEOF
+          )"
+            sec_code_html="$(cat <<XEOF
+          <section class="panel">
+            <h2>${n_code}. What This Code Is</h2>
+            <p class="kindline">${ov_kind}</p>
+            ${ov_readme_html}
+            ${ov_fw_html}${ov_struct_html}${ov_entry_block_html}${ov_cmds_block_html}${ov_big_block_html}
+          </section>
+          XEOF
+          )"
+            sec_profile_md="$(cat <<XEOF
+          ## ${n_profile}. Repository & Code Profile
+
+          What is actually in this repository, measured from the checked-out tree.
+          Use it to judge whether the scan had enough material to be meaningful.
+
+          | Measure | Value |
+          | --- | --- |
+          | Files (excluding .git) | ${prof_files} |
+          | Directories | ${prof_dirs} |
+          | Working tree size | ${prof_size} |
+          | Text files profiled | ${prof_text} |
+          | Lines of text | ${prof_lines} |
+          | Dependency manifests / lockfiles | ${prof_dep} |
+          | Infrastructure & CI files | ${prof_infra} |
+          | GitHub Actions workflows | ${prof_workflows} |
+          | Test directories | ${prof_tests} |
+
+          ${sub_lang_md}
+
+          ${sub_ext_md}
+
+          ${sub_signal_md}
+
+          ### Development activity
+
+          | Measure | Value |
+          | --- | --- |
+          | Commits | ${prof_commits} |
+          | Contributors | ${prof_contributors} |
+          | Commits in the last 90 days | ${prof_active} |
+          | First commit | ${prof_first} |
+          | Latest commit | ${prof_last} (\`${prof_sha}\`) |
+          | Latest commit message | ${prof_subject} |
+          | Latest commit author | ${prof_author} |
+          | Top authors | ${authors_line} |
+
+          ${sub_gov_md}
+          XEOF
+          )"
+            sec_profile_html="$(cat <<XEOF
+              <section class="panel">
+                <h2>${n_profile}. Repository &amp; Code Profile</h2>
+                <p class="sub">What is actually in this repository, measured from the checked-out
+                tree &mdash; enough to judge whether the scan had material to work with.</p>
+                <div class="grid">
+                  <div class="card"><div class="label">Files</div><div class="value">${prof_files}</div></div>
+                  <div class="card"><div class="label">Lines of text</div><div class="value">${prof_lines}</div></div>
+                  <div class="card"><div class="label">Tree size</div><div class="value">${prof_size}</div></div>
+                  <div class="card"><div class="label">Manifests</div><div class="value">${prof_dep}</div></div>
+                  <div class="card"><div class="label">Infra / CI files</div><div class="value">${prof_infra}</div></div>
+                  <div class="card"><div class="label">Commits</div><div class="value">${prof_commits}</div></div>
+                </div>
+
+                ${sub_lang_html}
+
+                ${sub_ext_html}
+
+                ${sub_signal_html}
+
+                <div class="subhead">Development activity</div>
+                <table>
+                  <tr><th>Contributors</th><td>${prof_contributors}</td></tr>
+                  <tr><th>Commits in the last 90 days</th><td>${prof_active}</td></tr>
+                  <tr><th>First commit</th><td>${prof_first}</td></tr>
+                  <tr><th>Latest commit</th><td>${prof_last} (<code>${prof_sha}</code>)</td></tr>
+                  <tr><th>Latest commit message</th><td>${prof_subject}</td></tr>
+                  <tr><th>Latest commit author</th><td>${prof_author}</td></tr>
+                  <tr><th>Top authors</th><td>${authors_line}</td></tr>
+                  <tr><th>Test directories</th><td>${prof_tests}</td></tr>
+                  <tr><th>Directories</th><td>${prof_dirs}</td></tr>
+                  <tr><th>Text files profiled</th><td>${prof_text}</td></tr>
+                </table>
+
+                ${sub_gov_html}
+              </section>
+          XEOF
+          )"
+          fi
+
+          sec_score_md=""; sec_score_html=""
+          if [ "${have_score}" = "true" ]; then
+            sec_score_md="$(cat <<XEOF
+          ## ${n_score}. Repository Posture (OpenSSF Scorecard)
+
+          **Aggregate Scorecard: ${scorecard_score}/10.** Scores reflect repository
+          security hygiene (branch protection, dependency pinning, dangerous
+          workflows, maintenance, and more) rather than findings in the code.
+
+          | Check | Score | Reason |
+          | --- | --- | --- |
+          ${scorecard_md}
+          XEOF
+          )"
+            sec_score_html="$(cat <<XEOF
+              <section class="panel">
+                <h2>${n_score}. Repository Posture (OpenSSF Scorecard)</h2>
+                <p class="sub">Aggregate Scorecard: <strong>${scorecard_score}/10</strong>. These checks
+                reflect repository security hygiene &mdash; branch protection, dependency pinning,
+                dangerous workflows, maintenance &mdash; rather than findings in the code.</p>
+                <div class="table-scroll">
+                  <table class="findings">
+                    <thead><tr><th>Check</th><th>Score</th><th>Reason</th></tr></thead>
+                    <tbody>
+                      ${scorecard_html}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+          XEOF
+          )"
+          fi
+
+          sec_sbom_md=""; sec_sbom_html=""
+          if [ "${have_sbom}" = "true" ]; then
+            sec_sbom_md="$(cat <<XEOF
+          ## ${n_sbom}. Software Bill of Materials
+
+          The SBOM records what this software is actually made of, independent of
+          whether any scanner raised an alert. **${sbom_total} packages** were
+          catalogued: ${sbom_undeclared} declare no licence and ${sbom_copyleft}
+          carry a copyleft licence (GPL, AGPL, LGPL, MPL and similar) &mdash; both
+          are worth review before adopting or redistributing this code. Full SPDX
+          and CycloneDX files are attached to the run.
+
+          | Ecosystem | Packages |
+          | --- | ---: |
+          ${sbom_eco_md}
+
+          | Licence | Packages |
+          | --- | ---: |
+          ${sbom_lic_md}
+          XEOF
+          )"
+            sec_sbom_html="$(cat <<XEOF
+              <section class="panel">
+                <h2>${n_sbom}. Software Bill of Materials</h2>
+                <p class="sub">What this software is made of, independent of whether any scanner
+                raised an alert. Full SPDX and CycloneDX files are attached to the run.</p>
+                <div class="grid">
+                  <div class="card"><div class="label">Packages</div><div class="value">${sbom_total}</div></div>
+                  <div class="card"><div class="label">No licence declared</div><div class="value">${sbom_undeclared}</div></div>
+                  <div class="card"><div class="label">Copyleft</div><div class="value">${sbom_copyleft}</div></div>
+                </div>
+                <p class="sub" style="margin-top:14px;">Undeclared and copyleft (GPL, AGPL, LGPL,
+                MPL and similar) licences are both worth review before adopting or redistributing
+                this code.</p>
+
+                <div class="subhead">Packages by ecosystem</div>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>Ecosystem</th><th>Packages</th></tr></thead>
+                    <tbody>
+                      ${sbom_eco_html}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="subhead">Licence mix</div>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>Licence</th><th>Packages</th></tr></thead>
+                    <tbody>
+                      ${sbom_lic_html}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+          XEOF
+          )"
+          fi
+
           report_name="${REPORT_NAME_IN}"
           report_date="$(date -u '+%d %B %Y, %H:%M UTC')"
           report_id="${RUN_ID}-${RUN_ATTEMPT}"
@@ -1788,25 +2201,11 @@ jobs:
 
           ## Table of Contents
 
-          1. Scan & Repository Overview
-          2. What This Code Is
-          3. Repository & Code Profile
-          4. Risk Posture
-          5. Fix This First
-          6. Scan Coverage
-          7. Findings Snapshot
-          8. Exploited & High-Risk CVEs
-          9. Software Bill of Materials
-          10. Repository Posture (OpenSSF Scorecard)
-          11. Detailed Findings
-          12. Job Status
-          13. Where To Look
-          14. Reading The Results
-          15. Scan Map
+          ${TOC_MD}
 
           ---------------------------------------------------------------
 
-          ## 1. Scan & Repository Overview
+          ## ${n_overview}. Scan & Repository Overview
 
           | Field | Value |
           | --- | --- |
@@ -1827,106 +2226,11 @@ jobs:
 
           **Quick links:** [Code](${repo_url}) &middot; [Issues](${repo_url}/issues) &middot; [Pull requests](${repo_url}/pulls) &middot; [Commits](${repo_url}/commits) &middot; [Security](${repo_url}/security) &middot; [Dependency graph](${repo_url}/network/dependencies)
 
-          ## 2. What This Code Is
+          ${sec_code_md}
 
-          **${ov_kind}.**
+          ${sec_profile_md}
 
-          ### Overview
-
-          ${ov_readme_md}
-
-          ### Frameworks and libraries in use
-
-          ${ov_frameworks}
-
-          Read from the declared dependencies in the manifests, not from prose,
-          so the names are what the project actually pulls in.
-
-          ### Repository structure
-
-          | Path | Role | Files | Lines |
-          | --- | --- | ---: | ---: |
-          ${ov_dirs_md}
-
-          ### Entry points and network surface
-
-          Where execution starts and where the code listens. These are the places
-          untrusted input reaches this software first.
-
-          | Kind | Detail |
-          | --- | --- |
-          ${ov_entry_md}
-
-          ### How it is built and run
-
-          | Command | Source |
-          | --- | --- |
-          ${ov_cmds_md}
-
-          ### Where the complexity lives
-
-          The largest source files, excluding vendored, generated and minified
-          code. Concentrated complexity is where defects and review effort go.
-
-          | File | Lines |
-          | --- | ---: |
-          ${ov_big_md}
-
-          ## 3. Repository & Code Profile
-
-          What is actually in this repository, measured from the checked-out tree.
-          Use it to judge whether the scan had enough material to be meaningful.
-
-          | Measure | Value |
-          | --- | --- |
-          | Files (excluding .git) | ${prof_files} |
-          | Directories | ${prof_dirs} |
-          | Working tree size | ${prof_size} |
-          | Text files profiled | ${prof_text} |
-          | Lines of text | ${prof_lines} |
-          | Dependency manifests / lockfiles | ${prof_dep} |
-          | Infrastructure & CI files | ${prof_infra} |
-          | GitHub Actions workflows | ${prof_workflows} |
-          | Test directories | ${prof_tests} |
-
-          ### Language mix
-
-          | Language | Share |
-          | --- | ---: |
-          ${lang_md}
-
-          ### Code by file type (top 12 by lines)
-
-          | Extension | Files | Lines |
-          | --- | ---: | ---: |
-          ${ext_md}
-
-          ### Dependency & infrastructure signals
-
-          | Signal | Kind | Files |
-          | --- | --- | ---: |
-          ${signal_md}
-
-          ### Development activity
-
-          | Measure | Value |
-          | --- | --- |
-          | Commits | ${prof_commits} |
-          | Contributors | ${prof_contributors} |
-          | Commits in the last 90 days | ${prof_active} |
-          | First commit | ${prof_first} |
-          | Latest commit | ${prof_last} (\`${prof_sha}\`) |
-          | Latest commit message | ${prof_subject} |
-          | Latest commit author | ${prof_author} |
-          | Top authors | ${authors_line} |
-
-          ### Governance files
-
-          | File | Status |
-          | --- | --- |
-          ${gov_md}
-
-          ## 4. Risk Posture
+          ## ${n_risk}. Risk Posture
 
           **Overall grade: ${grade} (${grade_word}) &mdash; posture score ${score_display}**
 
@@ -1950,7 +2254,7 @@ jobs:
 
           **Trend:** ${trend_text}
 
-          ## 5. Fix This First
+          ## ${n_fix}. Fix This First
 
           ${fixable_count} of the ${total_count} findings have a published fixed
           version. They are ordered by real-world risk: actively exploited (CISA
@@ -1961,7 +2265,7 @@ jobs:
           | --- | --- | --- | --- | ---: | --- | ---: |
           ${fix_md}
 
-          ## 6. Scan Coverage
+          ## ${n_cov}. Scan Coverage
 
           Every scanner, whether it ran, and what it had in front of it. A zero in
           the Findings column means one of three different things &mdash; the
@@ -1972,7 +2276,7 @@ jobs:
           | --- | --- | ---: | --- |
           ${COVERAGE_MD}
 
-          ## 7. Findings Snapshot
+          ## ${n_snap}. Findings Snapshot
 
           | Scanner | Findings in artifact |
           | --- | ---: |
@@ -1988,7 +2292,7 @@ jobs:
           Per-scanner counts are raw artifact contents. The unique total is what
           the risk grade is calculated from.
 
-          ## 8. Exploited & High-Risk CVEs
+          ## ${n_cve}. Exploited & High-Risk CVEs
 
           Of ${cve_total} unique CVEs across the dependency and image scans,
           ${kev_count} are in the CISA Known Exploited Vulnerabilities catalog and
@@ -1999,34 +2303,11 @@ jobs:
           | --- | --- | ---: |
           ${cve_md}
 
-          ## 9. Software Bill of Materials
+          ${sec_sbom_md}
 
-          The SBOM records what this software is actually made of, independent of
-          whether any scanner raised an alert. **${sbom_total} packages** were
-          catalogued: ${sbom_undeclared} declare no licence and ${sbom_copyleft}
-          carry a copyleft licence (GPL, AGPL, LGPL, MPL and similar) &mdash; both
-          are worth review before adopting or redistributing this code. Full SPDX
-          and CycloneDX files are attached to the run.
+          ${sec_score_md}
 
-          | Ecosystem | Packages |
-          | --- | ---: |
-          ${sbom_eco_md}
-
-          | Licence | Packages |
-          | --- | ---: |
-          ${sbom_lic_md}
-
-          ## 10. Repository Posture (OpenSSF Scorecard)
-
-          **Aggregate Scorecard: ${scorecard_score}/10.** Scores reflect repository
-          security hygiene (branch protection, dependency pinning, dangerous
-          workflows, maintenance, and more) rather than findings in the code.
-
-          | Check | Score | Reason |
-          | --- | --- | --- |
-          ${scorecard_md}
-
-          ## 11. Detailed Findings
+          ## ${n_detail}. Detailed Findings
 
           Every issue each scanner reported, with a link to review it in context
           (source line on GitHub, or the advisory for a vulnerable dependency).
@@ -2035,7 +2316,7 @@ jobs:
           | --- | --- | --- | --- | --- | --- |
           ${FINDINGS_MD}
 
-          ## 12. Job Status
+          ## ${n_jobs}. Job Status
 
           | Job | Result |
           | --- | --- |
@@ -2045,13 +2326,13 @@ jobs:
           | SBOM | \`${R_SBOM}\` |
           | Repository Posture | \`${R_POSTURE}\` |
 
-          ## 13. Where To Look
+          ## ${n_look}. Where To Look
 
           1. Open **Security -> Code scanning alerts** for line-level findings.
           2. Open **Actions -> this run -> Artifacts** for raw SARIF and SBOM downloads.
           3. Use the SBOM artifacts for inventory, license, and supply-chain review.
 
-          ## 14. Reading The Results
+          ## ${n_read}. Reading The Results
 
           - Semgrep surfaces code patterns that may lead to security issues or insecure DOM handling.
           - Gitleaks checks for exposed credentials or tokens in git history.
@@ -2060,7 +2341,7 @@ jobs:
           - SBOM artifacts show what is in the build even when no alert is raised.
           - The risk grade and CVE enrichment (CISA KEV, FIRST EPSS) help triage which findings to fix first.
 
-          ## 15. Scan Map
+          ## ${n_map}. Scan Map
 
           \`\`\`mermaid
           flowchart LR
@@ -2080,6 +2361,11 @@ jobs:
           ---------------------------------------------------------------
           TIDHQ.NETWORK | Confidential | Report ID ${report_id}
           EOF
+
+          # Sections that dropped out leave runs of blank lines behind. Collapse
+          # them so the plain-text report still reads cleanly in a mail client.
+          awk 'BEGIN{b=0} /^[[:space:]]*$/{b++; if (b<2) print ""; next} {b=0; print}' \
+            report/report.md > report/report.md.tmp && mv report/report.md.tmp report/report.md
 
           cat > report/report.html <<EOF
           <!doctype html>
@@ -2311,25 +2597,12 @@ jobs:
                 Security tab and in the raw SARIF artifacts attached to this report.</p>
                 <p><strong>Contents:</strong></p>
                 <ol>
-                  <li>Scan &amp; Repository Overview</li>
-                  <li>What This Code Is</li>
-                  <li>Repository &amp; Code Profile</li>
-                  <li>Risk Posture</li>
-                  <li>Fix This First</li>
-                  <li>Scan Coverage</li>
-                  <li>Findings Snapshot</li>
-                  <li>Exploited &amp; High-Risk CVEs</li>
-                  <li>Software Bill of Materials</li>
-                  <li>Repository Posture (OpenSSF Scorecard)</li>
-                  <li>Detailed Findings</li>
-                  <li>Job Status</li>
-                  <li>Where To Look</li>
-                  <li>Reading The Results</li>
+                  ${TOC_HTML}
                 </ol>
               </section>
 
               <section class="panel">
-                <h2>1. Scan &amp; Repository Overview</h2>
+                <h2>${n_overview}. Scan &amp; Repository Overview</h2>
                 <table>
                   <tr><th>Repository</th><td><a href="${repo_url}">${TARGET_REPO}</a></td></tr>
                   <tr><th>Description</th><td>${repo_desc_html}</td></tr>
@@ -2357,131 +2630,12 @@ jobs:
                 </p>
               </section>
 
-              <section class="panel">
-                <h2>2. What This Code Is</h2>
-                <p class="kindline">${ov_kind}.</p>
-                ${ov_readme_html}
+              ${sec_code_html}
 
-                <div class="subhead">Frameworks and libraries in use</div>
-                <p class="sub">${ov_frameworks}</p>
-                <p class="sub">Read from the declared dependencies in the manifests, not from
-                prose, so the names are what the project actually pulls in.</p>
-
-                <div class="subhead">Repository structure</div>
-                <div class="table-scroll">
-                  <table class="findings fixtable">
-                    <thead><tr><th>Path</th><th>Role</th><th>Files</th><th>Lines</th></tr></thead>
-                    <tbody>
-                      ${ov_dirs_html}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div class="subhead">Entry points and network surface</div>
-                <p class="sub">Where execution starts and where the code listens &mdash; the places
-                untrusted input reaches this software first.</p>
-                <div class="table-scroll">
-                  <table class="findings fixtable">
-                    <thead><tr><th>Kind</th><th>Detail</th></tr></thead>
-                    <tbody>
-                      ${ov_entry_html}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div class="subhead">How it is built and run</div>
-                <div class="table-scroll">
-                  <table class="findings fixtable">
-                    <thead><tr><th>Command</th><th>Source</th></tr></thead>
-                    <tbody>
-                      ${ov_cmds_html}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div class="subhead">Where the complexity lives</div>
-                <p class="sub">The largest source files, excluding vendored, generated and minified
-                code. Concentrated complexity is where defects and review effort go.</p>
-                <div class="table-scroll">
-                  <table class="findings fixtable">
-                    <thead><tr><th>File</th><th>Lines</th></tr></thead>
-                    <tbody>
-                      ${ov_big_html}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
+              ${sec_profile_html}
 
               <section class="panel">
-                <h2>3. Repository &amp; Code Profile</h2>
-                <p class="sub">What is actually in this repository, measured from the checked-out
-                tree &mdash; enough to judge whether the scan had material to work with.</p>
-                <div class="grid">
-                  <div class="card"><div class="label">Files</div><div class="value">${prof_files}</div></div>
-                  <div class="card"><div class="label">Lines of text</div><div class="value">${prof_lines}</div></div>
-                  <div class="card"><div class="label">Tree size</div><div class="value">${prof_size}</div></div>
-                  <div class="card"><div class="label">Manifests</div><div class="value">${prof_dep}</div></div>
-                  <div class="card"><div class="label">Infra / CI files</div><div class="value">${prof_infra}</div></div>
-                  <div class="card"><div class="label">Commits</div><div class="value">${prof_commits}</div></div>
-                </div>
-
-                <div class="subhead">Language mix</div>
-                <div class="table-scroll">
-                  <table class="findings">
-                    <thead><tr><th>Language</th><th>Share</th></tr></thead>
-                    <tbody>
-                      ${lang_html}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div class="subhead">Code by file type (top 12 by lines)</div>
-                <div class="table-scroll">
-                  <table class="findings">
-                    <thead><tr><th>Extension</th><th>Files</th><th>Lines</th></tr></thead>
-                    <tbody>
-                      ${ext_html}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div class="subhead">Dependency &amp; infrastructure signals</div>
-                <div class="table-scroll">
-                  <table class="findings">
-                    <thead><tr><th>Signal</th><th>Kind</th><th>Files</th></tr></thead>
-                    <tbody>
-                      ${signal_html}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div class="subhead">Development activity</div>
-                <table>
-                  <tr><th>Contributors</th><td>${prof_contributors}</td></tr>
-                  <tr><th>Commits in the last 90 days</th><td>${prof_active}</td></tr>
-                  <tr><th>First commit</th><td>${prof_first}</td></tr>
-                  <tr><th>Latest commit</th><td>${prof_last} (<code>${prof_sha}</code>)</td></tr>
-                  <tr><th>Latest commit message</th><td>${prof_subject}</td></tr>
-                  <tr><th>Latest commit author</th><td>${prof_author}</td></tr>
-                  <tr><th>Top authors</th><td>${authors_line}</td></tr>
-                  <tr><th>Test directories</th><td>${prof_tests}</td></tr>
-                  <tr><th>Directories</th><td>${prof_dirs}</td></tr>
-                  <tr><th>Text files profiled</th><td>${prof_text}</td></tr>
-                </table>
-
-                <div class="subhead">Governance files</div>
-                <div class="table-scroll">
-                  <table class="findings">
-                    <thead><tr><th>File</th><th>Status</th></tr></thead>
-                    <tbody>
-                      ${gov_html}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-
-              <section class="panel">
-                <h2>4. Risk Posture</h2>
+                <h2>${n_risk}. Risk Posture</h2>
                 <div class="posture">
                   <span class="grade ${grade_class}">${grade}</span>
                   <span class="pmeta"><strong>${grade_word}</strong> &mdash; posture score ${score_display}<br>
@@ -2502,7 +2656,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>5. Fix This First</h2>
+                <h2>${n_fix}. Fix This First</h2>
                 <p class="sub">${fixable_count} of the ${total_count} findings have a published
                 fixed version. Ordered by real-world risk: actively exploited (CISA KEV) first,
                 then by EPSS exploitation probability, then by severity. Top 25.</p>
@@ -2517,7 +2671,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>6. Scan Coverage</h2>
+                <h2>${n_cov}. Scan Coverage</h2>
                 <p class="sub">Every scanner, whether it ran, and what it had in front of it.
                 A zero in Findings means one of three different things &mdash; the scanner ran and
                 found nothing, it had nothing of its kind to look at, or it never ran. This table
@@ -2533,7 +2687,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>7. Findings Snapshot</h2>
+                <h2>${n_snap}. Findings Snapshot</h2>
                 <div class="grid">
                   <div class="card"><div class="label">Semgrep</div><div class="value">${semgrep_count}</div></div>
                   <div class="card"><div class="label">Gitleaks</div><div class="value">${gitleaks_count}</div></div>
@@ -2548,7 +2702,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>8. Exploited &amp; High-Risk CVEs</h2>
+                <h2>${n_cve}. Exploited &amp; High-Risk CVEs</h2>
                 <p class="sub">Of ${cve_total} unique CVEs across the dependency and image scans,
                 <strong>${kev_count}</strong> are in the CISA Known Exploited Vulnerabilities catalog and
                 <strong>${epss_hi_count}</strong> have an EPSS exploitation probability of 10% or higher.
@@ -2563,57 +2717,12 @@ jobs:
                 </div>
               </section>
 
-              <section class="panel">
-                <h2>9. Software Bill of Materials</h2>
-                <p class="sub">What this software is made of, independent of whether any scanner
-                raised an alert. Full SPDX and CycloneDX files are attached to the run.</p>
-                <div class="grid">
-                  <div class="card"><div class="label">Packages</div><div class="value">${sbom_total}</div></div>
-                  <div class="card"><div class="label">No licence declared</div><div class="value">${sbom_undeclared}</div></div>
-                  <div class="card"><div class="label">Copyleft</div><div class="value">${sbom_copyleft}</div></div>
-                </div>
-                <p class="sub" style="margin-top:14px;">Undeclared and copyleft (GPL, AGPL, LGPL,
-                MPL and similar) licences are both worth review before adopting or redistributing
-                this code.</p>
+              ${sec_sbom_html}
 
-                <div class="subhead">Packages by ecosystem</div>
-                <div class="table-scroll">
-                  <table class="findings fixtable">
-                    <thead><tr><th>Ecosystem</th><th>Packages</th></tr></thead>
-                    <tbody>
-                      ${sbom_eco_html}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div class="subhead">Licence mix</div>
-                <div class="table-scroll">
-                  <table class="findings fixtable">
-                    <thead><tr><th>Licence</th><th>Packages</th></tr></thead>
-                    <tbody>
-                      ${sbom_lic_html}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
+              ${sec_score_html}
 
               <section class="panel">
-                <h2>10. Repository Posture (OpenSSF Scorecard)</h2>
-                <p class="sub">Aggregate Scorecard: <strong>${scorecard_score}/10</strong>. These checks
-                reflect repository security hygiene &mdash; branch protection, dependency pinning,
-                dangerous workflows, maintenance &mdash; rather than findings in the code.</p>
-                <div class="table-scroll">
-                  <table class="findings">
-                    <thead><tr><th>Check</th><th>Score</th><th>Reason</th></tr></thead>
-                    <tbody>
-                      ${scorecard_html}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-
-              <section class="panel">
-                <h2>11. Detailed Findings</h2>
+                <h2>${n_detail}. Detailed Findings</h2>
                 <p class="sub">Every issue each scanner reported, with a link to review it in
                 context &mdash; the source line on GitHub, or the advisory for a vulnerable dependency.</p>
                 <div class="table-scroll">
@@ -2629,7 +2738,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>12. Job Status</h2>
+                <h2>${n_jobs}. Job Status</h2>
                 <table>
                   <tr><th>Code And Secrets</th><td>${R_CODE}</td></tr>
                   <tr><th>Dependency And Supply Chain</th><td>${R_DEP}</td></tr>
@@ -2640,7 +2749,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>13. Where To Look</h2>
+                <h2>${n_look}. Where To Look</h2>
                 <ol>
                   <li>Open <code>Security -&gt; Code scanning alerts</code> for line-level issues.</li>
                   <li>Open <code>Actions -&gt; this run -&gt; Artifacts</code> for SARIF and SBOM files.</li>
@@ -2649,7 +2758,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>14. Reading The Results</h2>
+                <h2>${n_read}. Reading The Results</h2>
                 <ul>
                   <li>Semgrep checks application code and custom AI/ML guardrails.</li>
                   <li>Gitleaks checks git history for secrets.</li>

@@ -373,7 +373,7 @@ jobs:
 
       - name: Upload code scan artifacts
         if: ${{ always() && inputs.upload_artifacts }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tid-secureci-code-and-secrets
           if-no-files-found: ignore
@@ -446,7 +446,7 @@ jobs:
 
       - name: Upload dependency scan artifacts
         if: ${{ always() && inputs.upload_artifacts }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tid-secureci-dependency-scan
           if-no-files-found: ignore
@@ -572,7 +572,7 @@ jobs:
 
       - name: Upload infrastructure scan artifacts
         if: ${{ always() && inputs.upload_artifacts }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tid-secureci-infrastructure
           if-no-files-found: ignore
@@ -2038,7 +2038,7 @@ jobs:
           EOF
 
       - name: Upload summary report artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tid-secureci-report
           path: report/

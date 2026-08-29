@@ -2045,7 +2045,7 @@ jobs:
 
       - name: Email report
         if: ${{ env.MAIL_ENABLED == 'true' }}
-        uses: dawidd6/action-send-mail@v3
+        uses: dawidd6/action-send-mail@v18
         with:
           server_address: ${{ secrets.smtp_server }}
           server_port: ${{ secrets.smtp_port || '587' }}

@@ -56,9 +56,12 @@ gh workflow run scan-external.yml \
 
 | Input | Required | Meaning |
 | --- | --- | --- |
-| `target_repository` | yes | The `owner/repo` to scan |
-| `target_ref` | no | Branch, tag, or SHA. Blank = the target's default branch |
+| `target_repository` | yes | The repo to scan. `owner/repo`, or paste the GitHub URL — `https://github.com/owner/repo`, an SSH remote, or a `.../tree/<branch>` link all work |
+| `target_ref` | no | Branch, tag, or SHA. Blank = the target's default branch (or the branch in a `/tree/` link) |
 | `report_recipient` | no | Where the report is emailed. Blank = the TIDHQ owner address |
+
+A target that isn't a readable repository is rejected up front with a clear error,
+rather than being scanned as nothing.
 
 ### Watch it and download the results
 
@@ -75,8 +78,12 @@ gh run download "$RUN" -R TIDHQ-NETWORK/TID-SecureCI
 
 When it finishes you get:
 
-- 📧 an **emailed report** (branded HTML + Markdown, with a Detailed Findings table
-  and raw scanner output attached);
+- 📧 an **emailed report** (branded HTML + Markdown) covering the repository and its
+  code — language mix, size, code volume by file type, dependency and infrastructure
+  signals, commit activity and governance files — plus a **Scan Coverage** table
+  showing what each scanner ran against, the risk grade and severity breakdown, KEV
+  and EPSS enrichment, the OpenSSF Scorecard, and a Detailed Findings table with raw
+  scanner output attached;
 - 📦 **artifacts** on the run — `tid-secureci-report` (HTML/Markdown) plus the raw
   SARIF and SBOM files;
 - 📊 a **findings table** on the run's Summary page.
@@ -182,6 +189,10 @@ Use a fine-grained PAT or app token with **read** access to the target's content
 | `could not find any workflows named scan-external.yml` | Run with `-R TIDHQ-NETWORK/TID-SecureCI`; the workflow lives in that repo |
 | `HTTP 403` / can't dispatch | You need write/Actions permission on `TIDHQ-NETWORK/TID-SecureCI`, or use the web UI |
 | Run is red with `not our ref` | The `target_ref` doesn't exist in the target — leave it blank or pass a real branch/SHA |
+| `is not a scannable target` | The target isn't a repository. Pass `owner/repo` or a GitHub URL |
+| `Cannot read repos/...` | Typo in the target, or it's private — supply a `checkout_token` secret with read access |
+| Report says **Scan did not complete** | One or more scanner jobs failed, so the findings count is not a clean bill of health. Open Job Status in the report (or the run's Job Results) for the failing job, then re-run |
+| Report shows 0 findings | Read the **Scan Coverage** section — it says whether each scanner ran and nothing was found, had nothing of its kind to look at (e.g. no lockfiles for OSV), or never ran |
 | No email arrived | SMTP isn't configured for that caller, or `report_recipient` was empty — check spam, then [EMAIL-SETUP.md](EMAIL-SETUP.md) |
 | Findings missing from the target's Security tab | Expected for repos you don't own — read the email/artifacts instead |
 

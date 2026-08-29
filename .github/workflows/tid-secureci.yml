@@ -116,20 +116,65 @@ jobs:
     steps:
       - id: resolve
         shell: bash
+        # Target values arrive via env, not inlined ${{ }}, so a target name can
+        # never be spliced into this script as shell syntax.
+        env:
+          RAW_REPOSITORY: ${{ inputs.target_repository }}
+          RAW_REF: ${{ inputs.target_ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.checkout_token || github.token }}
         run: |
           set -euo pipefail
 
-          repository="${{ inputs.target_repository }}"
-          ref="${{ inputs.target_ref }}"
+          repository="$(printf '%s' "${RAW_REPOSITORY}" | tr -d '[:space:]')"
+          ref="$(printf '%s' "${RAW_REF}" | tr -d '[:space:]')"
+
+          # Accept what people actually paste. actions/checkout only takes
+          # owner/repo, so a pasted browser URL used to fail every scan job in
+          # seconds while the summary job still emailed a clean-looking report
+          # with zero findings. Normalise here, and refuse anything that is
+          # still not a repository rather than scanning nothing.
+          if [ -n "${repository}" ]; then
+            normalized="$(printf '%s' "${repository}" \
+              | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#^[^/@]+@##; s#^github\.com:#github.com/#; s#^(www\.)?github\.com/##; s#/+$##')"
+
+            # A deep link such as .../tree/<branch> also tells us the ref.
+            deep_ref="$(printf '%s' "${normalized}" \
+              | sed -nE 's#^[^/]+/[^/]+/(tree|blob|commit|commits)/([^/?#]+).*#\2#p')"
+
+            normalized="$(printf '%s' "${normalized}" | cut -d'/' -f1,2)"
+            normalized="${normalized%.git}"
+
+            if [ -z "${ref}" ] && [ -n "${deep_ref}" ]; then
+              ref="${deep_ref}"
+              echo "Picked up ref '${ref}' from the target link."
+            fi
+            if [ "${normalized}" != "${repository}" ]; then
+              echo "Normalized target '${repository}' to '${normalized}'."
+            fi
+            repository="${normalized}"
+          fi
 
           if [ -z "${repository}" ]; then
-            repository="${{ github.repository }}"
+            repository="${CALLER_REPOSITORY}"
+          fi
+
+          if ! printf '%s' "${repository}" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$'; then
+            echo "::error::'${RAW_REPOSITORY}' is not a scannable target. Pass owner/repo (for example TIDHQ-NETWORK/TID-SecureCI) or a GitHub URL to that repository."
+            exit 1
+          fi
+
+          # Fail here, loudly, rather than four checkout failures later.
+          if ! gh api "repos/${repository}" --silent >/dev/null 2>&1; then
+            echo "::error::Cannot read repos/${repository}. Check the spelling, or supply a checkout_token secret with read access if the target is private."
+            exit 1
           fi
 
           # Whether we are scanning the caller's own repository (self-scan) or a
           # different/remote repository. Code-scanning SARIF uploads only work
           # for the caller's own commits, so this gates those uploads later.
-          if [ "${repository}" = "${{ github.repository }}" ]; then
+          if [ "${repository}" = "${CALLER_REPOSITORY}" ]; then
             is_self="true"
           else
             is_self="false"
@@ -139,7 +184,7 @@ jobs:
           # For a remote target the caller SHA is not a ref in that repo, so
           # leave it blank and let checkout use the target's default branch.
           if [ -z "${ref}" ] && [ "${is_self}" = "true" ]; then
-            ref="${{ github.sha }}"
+            ref="${CALLER_SHA}"
           fi
 
           echo "is_self=${is_self}" >> "${GITHUB_OUTPUT}"
@@ -574,6 +619,17 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check out target repository
+        id: profile_checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repository }}
+          ref: ${{ needs.prepare.outputs.ref }}
+          path: ${{ env.SCAN_DIR }}
+          fetch-depth: 0
+          token: ${{ secrets.checkout_token || github.token }}
+
       - name: Run OpenSSF Scorecard
         shell: bash
         env:
@@ -600,12 +656,179 @@ jobs:
             echo '{}' > results/scorecard.json
           fi
 
-      - name: Upload scorecard artifact
+      - name: Profile repository and code
+        if: ${{ always() }}
+        shell: bash
+        # Produces results/inventory.json: what the repository actually contains
+        # (size, languages, code volume, dependency and infrastructure signals,
+        # git activity, governance files). The report uses this to describe the
+        # target and to explain WHY a scanner reported nothing, so a quiet scan
+        # is never mistaken for a broken one.
+        env:
+          GH_TOKEN: ${{ secrets.checkout_token || github.token }}
+          TARGET: ${{ needs.prepare.outputs.repository }}
+        run: |
+          set -uo pipefail
+
+          mkdir -p results
+          echo '{}' > results/inventory.json
+
+          if [ ! -d "${SCAN_DIR}" ]; then
+            echo "Target checkout unavailable; skipping repository profile."
+            exit 0
+          fi
+
+          work="${RUNNER_TEMP}/profile"
+          mkdir -p "${work}"
+          cd "${SCAN_DIR}"
+
+          files_total=$(find . -path ./.git -prune -o -type f -print 2>/dev/null | wc -l)
+          dirs_total=$(find . -path ./.git -prune -o -mindepth 1 -type d -print 2>/dev/null | wc -l)
+          size_kb=$(du -sk --exclude=.git . 2>/dev/null | cut -f1)
+          [ -z "${size_kb}" ] && size_kb=0
+
+          # Line counts per file extension, over text files only. Binaries and
+          # anything above 4 MB are skipped so a repo full of model weights or
+          # fixtures does not distort the code profile.
+          find . -path ./.git -prune -o -type f -size -4M -print0 2>/dev/null > "${work}/all.z" || true
+          xargs -0 -r grep -Il -- '' < "${work}/all.z" > "${work}/text.txt" 2>/dev/null || true
+          tr '\n' '\0' < "${work}/text.txt" \
+            | xargs -0 -r wc -l 2>/dev/null \
+            | grep -vE '^[[:space:]]*[0-9]+[[:space:]]+total$' > "${work}/wc.txt" || true
+
+          awk '
+            { n=$1; $1=""; sub(/^[ \t]+/,""); path=$0
+              base=path; sub(/.*\//,"",base)
+              if (base ~ /^\.[^.]*$/)      { ext=base }
+              else if (base ~ /\./)        { ext=base; sub(/.*\./,".",ext) }
+              else                         { ext="(no extension)" }
+              files[ext]++; lines[ext]+=n }
+            END { for (e in files) printf "%s\t%d\t%d\n", e, files[e], lines[e] }
+          ' "${work}/wc.txt" | sort -t"$(printf '\t')" -k3,3nr > "${work}/ext.tsv"
+
+          text_files=$(awk -F'\t' '{s+=$2} END{print s+0}' "${work}/ext.tsv")
+          total_lines=$(awk -F'\t' '{s+=$3} END{print s+0}' "${work}/ext.tsv")
+
+          # How many files match a name pattern, anywhere in the tree.
+          nmatch() { find . -path ./.git -prune -o -type f -name "$1" -print 2>/dev/null | wc -l; }
+
+          : > "${work}/signals.tsv"
+          sig() {
+            local label="$1" kind="$2"; shift 2
+            local n=0 p
+            for p in "$@"; do n=$(( n + $(nmatch "${p}") )); done
+            [ "${n}" -gt 0 ] && printf '%s\t%s\t%d\n' "${kind}" "${label}" "${n}" >> "${work}/signals.tsv"
+            echo "${n}"
+          }
+
+          npm=$(sig "npm / Node"        dependency 'package.json' 'package-lock.json' 'yarn.lock' 'pnpm-lock.yaml')
+          pypi=$(sig "Python"           dependency 'requirements*.txt' 'pyproject.toml' 'Pipfile' 'Pipfile.lock' 'poetry.lock' 'setup.py')
+          gomod=$(sig "Go"              dependency 'go.mod' 'go.sum')
+          cargo=$(sig "Rust"            dependency 'Cargo.toml' 'Cargo.lock')
+          maven=$(sig "Java / JVM"      dependency 'pom.xml' 'build.gradle' 'build.gradle.kts' 'gradle.lockfile')
+          ruby=$(sig "Ruby"             dependency 'Gemfile' 'Gemfile.lock')
+          php=$(sig "PHP"               dependency 'composer.json' 'composer.lock')
+          dotnet=$(sig "NET"            dependency '*.csproj' '*.fsproj' 'packages.lock.json')
+
+          docker=$(sig "Dockerfiles"    infra 'Dockerfile' 'Dockerfile.*' '*.dockerfile')
+          compose=$(sig "Compose files" infra 'docker-compose*.yml' 'docker-compose*.yaml' 'compose.yml' 'compose.yaml')
+          tf=$(sig "Terraform"          infra '*.tf' '*.tfvars')
+          helm=$(sig "Helm charts"      infra 'Chart.yaml')
+          cfn=$(sig "CloudFormation"    infra '*.template' 'template.yaml')
+
+          workflows=$(find ./.github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | wc -l)
+          [ "${workflows}" -gt 0 ] && printf 'infra\t%s\t%d\n' "GitHub Actions workflows" "${workflows}" >> "${work}/signals.tsv"
+
+          dep_files=$(( npm + pypi + gomod + cargo + maven + ruby + php + dotnet ))
+          infra_files=$(( docker + compose + tf + helm + cfn + workflows ))
+
+          has() { [ "$(nmatch "$1")" -gt 0 ] && echo true || echo false; }
+          gov_readme=$(has 'README*')
+          gov_license=$(has 'LICENSE*')
+          gov_security=$(has 'SECURITY.md')
+          gov_contrib=$(has 'CONTRIBUTING*')
+          gov_owners=$(has 'CODEOWNERS')
+          gov_gitignore=$(has '.gitignore')
+          test_dirs=$(find . -path ./.git -prune -o -type d \( -name test -o -name tests -o -name spec -o -name __tests__ \) -print 2>/dev/null | wc -l)
+
+          commits=0; contributors=0; first_commit=""; last_commit=""
+          last_subject=""; last_author=""; last_sha=""; active_90=0
+          : > "${work}/authors.tsv"
+          if [ -d .git ]; then
+            commits=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+            contributors=$(git shortlog -sn --all 2>/dev/null | wc -l)
+            first_commit=$(git log --reverse --date=short --format=%ad 2>/dev/null | head -n1)
+            last_commit=$(git log -1 --date=short --format=%ad 2>/dev/null)
+            last_subject=$(git log -1 --format=%s 2>/dev/null | cut -c1-120)
+            last_author=$(git log -1 --format='%an' 2>/dev/null)
+            last_sha=$(git rev-parse --short HEAD 2>/dev/null)
+            active_90=$(git log --since='90 days ago' --oneline 2>/dev/null | wc -l)
+            git shortlog -sn --all 2>/dev/null | head -n 5 \
+              | sed -E 's/^[[:space:]]*([0-9]+)[[:space:]]+(.*)$/\2\t\1/' > "${work}/authors.tsv" || true
+          fi
+
+          languages="$(gh api "repos/${TARGET}/languages" 2>/dev/null || echo '{}')"
+          printf '%s' "${languages}" | jq empty >/dev/null 2>&1 || languages='{}'
+
+          tsv_json() { jq -R -s -c "$1" "$2" 2>/dev/null || echo '[]'; }
+          exts_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{ext:.[0],files:(.[1]|tonumber),lines:(.[2]|tonumber)})' "${work}/ext.tsv")"
+          signals_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{kind:.[0],label:.[1],count:(.[2]|tonumber)})' "${work}/signals.tsv")"
+          authors_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{name:.[0],commits:(.[1]|tonumber)})' "${work}/authors.tsv")"
+
+          cd - >/dev/null
+
+          jq -n \
+            --argjson files_total "${files_total}" \
+            --argjson dirs_total "${dirs_total}" \
+            --argjson size_kb "${size_kb}" \
+            --argjson text_files "${text_files}" \
+            --argjson total_lines "${total_lines}" \
+            --argjson dep_files "${dep_files}" \
+            --argjson infra_files "${infra_files}" \
+            --argjson workflows "${workflows}" \
+            --argjson test_dirs "${test_dirs}" \
+            --argjson languages "${languages}" \
+            --argjson extensions "${exts_json}" \
+            --argjson signals "${signals_json}" \
+            --argjson authors "${authors_json}" \
+            --argjson commits "${commits}" \
+            --argjson contributors "${contributors}" \
+            --argjson active_90 "${active_90}" \
+            --arg first_commit "${first_commit}" \
+            --arg last_commit "${last_commit}" \
+            --arg last_subject "${last_subject}" \
+            --arg last_author "${last_author}" \
+            --arg last_sha "${last_sha}" \
+            --argjson gov_readme "${gov_readme}" \
+            --argjson gov_license "${gov_license}" \
+            --argjson gov_security "${gov_security}" \
+            --argjson gov_contrib "${gov_contrib}" \
+            --argjson gov_owners "${gov_owners}" \
+            --argjson gov_gitignore "${gov_gitignore}" \
+            '{
+               files_total: $files_total, dirs_total: $dirs_total, size_kb: $size_kb,
+               text_files: $text_files, total_lines: $total_lines,
+               dep_files: $dep_files, infra_files: $infra_files,
+               workflows: $workflows, test_dirs: $test_dirs,
+               languages: $languages, extensions: $extensions, signals: $signals,
+               git: { commits: $commits, contributors: $contributors, active_90: $active_90,
+                      first_commit: $first_commit, last_commit: $last_commit,
+                      last_subject: $last_subject, last_author: $last_author,
+                      last_sha: $last_sha, authors: $authors },
+               governance: { readme: $gov_readme, license: $gov_license, security: $gov_security,
+                             contributing: $gov_contrib, codeowners: $gov_owners,
+                             gitignore: $gov_gitignore }
+             }' > results/inventory.json
+
+          echo "Profiled ${files_total} files, ${total_lines} lines of text."
+
+      - name: Upload posture artifacts
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: tid-secureci-scorecard
-          path: results/scorecard.json
+          if-no-files-found: ignore
+          path: results/
 
   summary:
     name: Summary
@@ -668,6 +891,13 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           ENFORCE: ${{ inputs.enforce }}
           FAIL_SEVERITY: ${{ inputs.fail_severity }}
+          IMAGE_REF: ${{ inputs.image_ref }}
+          EN_SEMGREP: ${{ inputs.enable_semgrep }}
+          EN_GITLEAKS: ${{ inputs.enable_gitleaks }}
+          EN_OSV: ${{ inputs.enable_osv }}
+          EN_CHECKOV: ${{ inputs.enable_checkov }}
+          EN_TRIVY: ${{ inputs.enable_trivy }}
+          EN_SBOM: ${{ inputs.enable_sbom }}
           R_CODE: ${{ needs.code-and-secrets.result }}
           R_DEP: ${{ needs.dependency-supply-chain.result }}
           R_INFRA: ${{ needs.infrastructure-and-images.result }}
@@ -737,7 +967,41 @@ jobs:
           elif [ "${score}" -ge 70 ]; then grade="C"; grade_word="Fair";     grade_class="grade-c"
           elif [ "${score}" -ge 50 ]; then grade="D"; grade_word="Weak";     grade_class="grade-d"
           else grade="F"; grade_word="Critical"; grade_class="grade-f"; fi
+          score_display="${score}/100"
+
+          # ---- Scan integrity -------------------------------------------------
+          # A scanner that never ran contributes zero findings, which previously
+          # read as a clean grade-A repository. Any job that did not succeed
+          # invalidates the grade and puts a warning at the top of the report.
+          failed_jobs=""
+          note_job() { [ "$2" = "success" ] || failed_jobs="${failed_jobs}${failed_jobs:+, }$1 (${2:-not run})"; }
+          note_job "Code And Secrets" "${R_CODE}"
+          note_job "Dependency And Supply Chain" "${R_DEP}"
+          note_job "Infrastructure And Images" "${R_INFRA}"
+
+          target_label="${TARGET_REPO}"
+          [ -z "${target_label}" ] && target_label="(target could not be resolved)"
+
+          status_html=""; status_md=""; report_flag=""
+          if [ -z "${TARGET_REPO}" ]; then
+            incomplete_text="The target repository could not be resolved from the workflow input, so no code was scanned. Pass the target as <code>owner/repo</code> or a GitHub URL and run the scan again."
+          elif [ -n "${failed_jobs}" ]; then
+            incomplete_text="This scan did not complete: ${failed_jobs}. The counts below cover only the scanners that ran, so a low total does not mean the repository is clean. Re-run the scan, then read the Job Status section for the failing job."
+          else
+            incomplete_text=""
+          fi
+
+          if [ -n "${incomplete_text}" ]; then
+            grade="?"; grade_word="Not graded"; grade_class="grade-d"
+            score_display="not scored &mdash; scan incomplete"
+            report_flag=" [INCOMPLETE]"
+            status_html="<section class=\"panel alert\"><h2>Scan did not complete</h2><p>${incomplete_text}</p></section>"
+            status_md="> **Scan did not complete.** $(printf '%s' "${incomplete_text}" | sed 's#<code>##g; s#</code>##g')"
+          fi
+
           echo "RISK_GRADE=${grade}" >> "${GITHUB_ENV}"
+          echo "REPORT_FLAG=${report_flag}" >> "${GITHUB_ENV}"
+          echo "TARGET_LABEL=${target_label}" >> "${GITHUB_ENV}"
 
           # ---- OpenSSF Scorecard (repository posture) -------------------------
           scorecard_score="—"; scorecard_html=""; scorecard_md=""
@@ -841,7 +1105,8 @@ jobs:
           [ -z "${link_ref}" ] && link_ref="HEAD"
 
           # ---- Repository metadata (best-effort; public repos via the API) ----
-          repo_json="$(gh api "repos/${link_repo}" 2>/dev/null || echo '{}')"
+          repo_json='{}'
+          [ -n "${link_repo}" ] && repo_json="$(gh api "repos/${link_repo}" 2>/dev/null || echo '{}')"
           rj() { printf '%s' "${repo_json}" | jq -r "$1" 2>/dev/null; }
           repo_url="$(rj '.html_url // ""')"
           [ -z "${repo_url}" ] && repo_url="https://github.com/${link_repo}"
@@ -872,6 +1137,146 @@ jobs:
           # Human-friendly ref label (blank ref means the target's default branch)
           ref_display="${TARGET_REF}"
           [ -z "${ref_display}" ] && ref_display="${repo_branch} (default branch)"
+
+          # ---- Repository & code profile (from the posture job's inventory) ---
+          inv="artifacts/inventory.json"
+          have_inv="false"
+          if [ -f "${inv}" ] && jq -e '(.files_total? // null) != null' "${inv}" >/dev/null 2>&1; then
+            have_inv="true"
+          fi
+
+          iv() { jq -r "$1" "${inv}" 2>/dev/null; }
+          prof_files=0; prof_dirs=0; prof_size="—"; prof_text=0; prof_lines=0
+          prof_dep=0; prof_infra=0; prof_workflows=0; prof_tests=0
+          prof_commits=0; prof_contributors=0; prof_active=0
+          prof_first="—"; prof_last="—"; prof_subject="—"; prof_author="—"; prof_sha="—"
+          lang_html=""; lang_md=""; ext_html=""; ext_md=""
+          signal_html=""; signal_md=""; gov_html=""; gov_md=""; authors_line="—"
+
+          if [ "${have_inv}" = "true" ]; then
+            prof_files="$(iv '.files_total')"
+            prof_dirs="$(iv '.dirs_total')"
+            prof_size="$(iv 'if .size_kb >= 1024 then ((.size_kb/1024*10|round)/10|tostring) + " MB" else ((.size_kb|tostring) + " KB") end')"
+            prof_text="$(iv '.text_files')"
+            prof_lines="$(iv '.total_lines')"
+            prof_dep="$(iv '.dep_files')"
+            prof_infra="$(iv '.infra_files')"
+            prof_workflows="$(iv '.workflows')"
+            prof_tests="$(iv '.test_dirs')"
+            prof_commits="$(iv '.git.commits')"
+            prof_contributors="$(iv '.git.contributors')"
+            prof_active="$(iv '.git.active_90')"
+            prof_first="$(iv '(.git.first_commit | select(length>0)) // "—"')"
+            prof_last="$(iv '(.git.last_commit | select(length>0)) // "—"')"
+            prof_subject="$(iv '((.git.last_subject | select(length>0)) // "—") | @html')"
+            prof_author="$(iv '((.git.last_author | select(length>0)) // "—") | @html')"
+            prof_sha="$(iv '(.git.last_sha | select(length>0)) // "—"')"
+            authors_line="$(iv '[(.git.authors // [])[] | (.name + " (" + (.commits|tostring) + ")")] | join(", ")')"
+            [ -z "${authors_line}" ] && authors_line="—"
+
+            # Language mix, by bytes, as GitHub itself measures it.
+            lang_html="$(iv '
+              (.languages // {}) | to_entries | (map(.value) | add) as $t
+              | if (($t // 0) == 0) then "" else
+                  (sort_by(-.value) | .[:8]
+                   | map("<tr><td>" + (.key|@html) + "</td><td>" + (((.value*1000/$t)|round)/10|tostring) + "%</td></tr>")
+                   | join("\n")) end')"
+            lang_md="$(iv '
+              (.languages // {}) | to_entries | (map(.value) | add) as $t
+              | if (($t // 0) == 0) then "" else
+                  (sort_by(-.value) | .[:8]
+                   | map("| " + .key + " | " + (((.value*1000/$t)|round)/10|tostring) + "% |")
+                   | join("\n")) end')"
+
+            ext_html="$(iv '(.extensions // [])[:12]
+              | map("<tr><td><code>" + (.ext|@html) + "</code></td><td>" + (.files|tostring) + "</td><td>" + (.lines|tostring) + "</td></tr>")
+              | join("\n")')"
+            ext_md="$(iv '(.extensions // [])[:12]
+              | map("| `" + .ext + "` | " + (.files|tostring) + " | " + (.lines|tostring) + " |")
+              | join("\n")')"
+
+            signal_html="$(iv '(.signals // [])
+              | map("<tr><td>" + (.label|@html) + "</td><td>" + (if .kind == "dependency" then "Dependency" else "Infrastructure / CI" end) + "</td><td>" + (.count|tostring) + "</td></tr>")
+              | join("\n")')"
+            signal_md="$(iv '(.signals // [])
+              | map("| " + .label + " | " + (if .kind == "dependency" then "Dependency" else "Infrastructure / CI" end) + " | " + (.count|tostring) + " |")
+              | join("\n")')"
+
+            gov_html="$(iv '(.governance // {}) | to_entries
+              | map("<tr><td>" + (.key|@html) + "</td><td>" + (if .value then "present" else "<span class=\"sev sev-warning\">missing</span>" end) + "</td></tr>")
+              | join("\n")')"
+            gov_md="$(iv '(.governance // {}) | to_entries
+              | map("| " + .key + " | " + (if .value then "present" else "missing" end) + " |")
+              | join("\n")')"
+          fi
+
+          [ -z "${lang_html}" ] && lang_html='<tr><td colspan="2">Language breakdown was not available for this target.</td></tr>'
+          [ -z "${lang_md}" ] && lang_md='| — | Language breakdown was not available. |'
+          [ -z "${ext_html}" ] && ext_html='<tr><td colspan="3">No text files were profiled for this target.</td></tr>'
+          [ -z "${ext_md}" ] && ext_md='| — | — | No text files were profiled. |'
+          [ -z "${signal_html}" ] && signal_html='<tr><td colspan="3">No dependency manifests or infrastructure files were detected in this repository.</td></tr>'
+          [ -z "${signal_md}" ] && signal_md='| — | — | No dependency manifests or infrastructure files detected. |'
+          [ -z "${gov_html}" ] && gov_html='<tr><td colspan="2">Repository governance files could not be inspected.</td></tr>'
+          [ -z "${gov_md}" ] && gov_md='| — | Repository governance files could not be inspected. |'
+
+          # ---- Scan coverage: what each scanner actually had to work with -----
+          # This is the section that distinguishes "nothing to find" from
+          # "nothing was looked at".
+          cov_status() {
+            if [ "$2" != "true" ]; then echo "disabled"; else echo "${1:-not run}"; fi
+          }
+          : > report/coverage_html.frag
+          : > report/coverage_md.frag
+          cov_row() {
+            local name="$1" status="$2" count="$3" detail="$4" cls
+            case "${status}" in
+              success)           cls="sev sev-note" ;;
+              disabled|skipped)  cls="sev" ;;
+              *)                 cls="sev sev-error" ;;
+            esac
+            printf '<tr><td>%s</td><td><span class="%s">%s</span></td><td>%s</td><td>%s</td></tr>\n' \
+              "${name}" "${cls}" "${status}" "${count}" "${detail}" >> report/coverage_html.frag
+            printf '| %s | %s | %s | %s |\n' "${name}" "${status}" "${count}" \
+              "$(printf '%s' "${detail}" | sed 's#</\{0,1\}code>##g; s#|#\\|#g')" >> report/coverage_md.frag
+          }
+
+          if [ "${have_inv}" = "true" ]; then
+            code_saw="${prof_text} text files, ${prof_lines} lines"
+            hist_saw="full history, ${prof_commits} commits"
+            if [ "${prof_dep}" -gt 0 ]; then
+              dep_saw="${prof_dep} dependency manifests / lockfiles"
+            else
+              dep_saw="no dependency manifests or lockfiles in this repository &mdash; there is nothing for OSV to resolve"
+            fi
+            if [ "${prof_infra}" -gt 0 ]; then
+              infra_saw="${prof_infra} infrastructure / CI files"
+            else
+              infra_saw="no Terraform, Dockerfiles, Compose, Helm or workflow files detected"
+            fi
+          else
+            code_saw="the checked-out working tree"
+            hist_saw="the repository git history"
+            dep_saw="manifests and lockfiles found in the tree"
+            infra_saw="infrastructure and CI files found in the tree"
+          fi
+
+          if [ -n "${IMAGE_REF}" ]; then
+            image_saw="image <code>${IMAGE_REF}</code>"
+          else
+            image_saw="no image_ref supplied &mdash; container image scanning was not requested"
+          fi
+
+          cov_row "Semgrep"     "$(cov_status "${R_CODE}" "${EN_SEMGREP}")"   "${semgrep_count}"     "${code_saw}"
+          cov_row "Gitleaks"    "$(cov_status "${R_CODE}" "${EN_GITLEAKS}")"  "${gitleaks_count}"    "${hist_saw}"
+          cov_row "OSV-Scanner" "$(cov_status "${R_DEP}" "${EN_OSV}")"        "${osv_count}"         "${dep_saw}"
+          cov_row "Checkov"     "$(cov_status "${R_INFRA}" "${EN_CHECKOV}")"  "${checkov_count}"     "${infra_saw}"
+          cov_row "Trivy FS"    "$(cov_status "${R_INFRA}" "${EN_TRIVY}")"    "${trivy_fs_count}"    "filesystem scan, filtered to <code>${FAIL_SEVERITY}</code> and to vulnerabilities that have a fix"
+          cov_row "Trivy Image" "$(cov_status "${R_INFRA}" "${EN_TRIVY}")"    "${trivy_image_count}" "${image_saw}"
+          cov_row "SBOM"        "$(cov_status "${R_SBOM}" "${EN_SBOM}")"      "&mdash;"              "SPDX and CycloneDX inventories attached to this run"
+          cov_row "Scorecard"   "${R_POSTURE:-not run}"                       "&mdash;"              "repository hygiene score, ${scorecard_score}/10"
+
+          COVERAGE_HTML="$(cat report/coverage_html.frag)"
+          COVERAGE_MD="$(cat report/coverage_md.frag)"
 
           html_jq='
             .runs[]?.results[]? as $r
@@ -957,6 +1362,8 @@ jobs:
 
           ---------------------------------------------------------------
 
+          ${status_md}
+
           ## Preface
 
           This document is an automated security assessment produced by the
@@ -970,15 +1377,17 @@ jobs:
           ## Table of Contents
 
           1. Scan & Repository Overview
-          2. Risk Posture
-          3. Findings Snapshot
-          4. Exploited & High-Risk CVEs
-          5. Repository Posture (OpenSSF Scorecard)
-          6. Detailed Findings
-          7. Job Status
-          8. Where To Look
-          9. Reading The Results
-          10. Scan Map
+          2. Repository & Code Profile
+          3. Risk Posture
+          4. Scan Coverage
+          5. Findings Snapshot
+          6. Exploited & High-Risk CVEs
+          7. Repository Posture (OpenSSF Scorecard)
+          8. Detailed Findings
+          9. Job Status
+          10. Where To Look
+          11. Reading The Results
+          12. Scan Map
 
           ---------------------------------------------------------------
 
@@ -1003,9 +1412,63 @@ jobs:
 
           **Quick links:** [Code](${repo_url}) &middot; [Issues](${repo_url}/issues) &middot; [Pull requests](${repo_url}/pulls) &middot; [Commits](${repo_url}/commits) &middot; [Security](${repo_url}/security) &middot; [Dependency graph](${repo_url}/network/dependencies)
 
-          ## 2. Risk Posture
+          ## 2. Repository & Code Profile
 
-          **Overall grade: ${grade} (${grade_word}) &mdash; posture score ${score}/100**
+          What is actually in this repository, measured from the checked-out tree.
+          Use it to judge whether the scan had enough material to be meaningful.
+
+          | Measure | Value |
+          | --- | --- |
+          | Files (excluding .git) | ${prof_files} |
+          | Directories | ${prof_dirs} |
+          | Working tree size | ${prof_size} |
+          | Text files profiled | ${prof_text} |
+          | Lines of text | ${prof_lines} |
+          | Dependency manifests / lockfiles | ${prof_dep} |
+          | Infrastructure & CI files | ${prof_infra} |
+          | GitHub Actions workflows | ${prof_workflows} |
+          | Test directories | ${prof_tests} |
+
+          ### Language mix
+
+          | Language | Share |
+          | --- | ---: |
+          ${lang_md}
+
+          ### Code by file type (top 12 by lines)
+
+          | Extension | Files | Lines |
+          | --- | ---: | ---: |
+          ${ext_md}
+
+          ### Dependency & infrastructure signals
+
+          | Signal | Kind | Files |
+          | --- | --- | ---: |
+          ${signal_md}
+
+          ### Development activity
+
+          | Measure | Value |
+          | --- | --- |
+          | Commits | ${prof_commits} |
+          | Contributors | ${prof_contributors} |
+          | Commits in the last 90 days | ${prof_active} |
+          | First commit | ${prof_first} |
+          | Latest commit | ${prof_last} (\`${prof_sha}\`) |
+          | Latest commit message | ${prof_subject} |
+          | Latest commit author | ${prof_author} |
+          | Top authors | ${authors_line} |
+
+          ### Governance files
+
+          | File | Status |
+          | --- | --- |
+          ${gov_md}
+
+          ## 3. Risk Posture
+
+          **Overall grade: ${grade} (${grade_word}) &mdash; posture score ${score_display}**
 
           | Severity | Count |
           | --- | ---: |
@@ -1022,7 +1485,18 @@ jobs:
 
           **Trend:** ${trend_text}
 
-          ## 3. Findings Snapshot
+          ## 4. Scan Coverage
+
+          Every scanner, whether it ran, and what it had in front of it. A zero in
+          the Findings column means one of three different things &mdash; the
+          scanner ran and found nothing, the scanner had nothing of its kind to
+          look at, or the scanner did not run at all. This table says which.
+
+          | Scanner | Status | Findings | What it examined |
+          | --- | --- | ---: | --- |
+          ${COVERAGE_MD}
+
+          ## 5. Findings Snapshot
 
           | Scanner | Findings in artifact |
           | --- | ---: |
@@ -1034,7 +1508,7 @@ jobs:
           | Trivy Image | ${trivy_image_count} |
           | Total | ${total_count} |
 
-          ## 4. Exploited & High-Risk CVEs
+          ## 6. Exploited & High-Risk CVEs
 
           Of ${cve_total} unique CVEs across the dependency and image scans,
           ${kev_count} are in the CISA Known Exploited Vulnerabilities catalog and
@@ -1045,7 +1519,7 @@ jobs:
           | --- | --- | ---: |
           ${cve_md}
 
-          ## 5. Repository Posture (OpenSSF Scorecard)
+          ## 7. Repository Posture (OpenSSF Scorecard)
 
           **Aggregate Scorecard: ${scorecard_score}/10.** Scores reflect repository
           security hygiene (branch protection, dependency pinning, dangerous
@@ -1055,7 +1529,7 @@ jobs:
           | --- | --- | --- |
           ${scorecard_md}
 
-          ## 6. Detailed Findings
+          ## 8. Detailed Findings
 
           Every issue each scanner reported, with a link to review it in context
           (source line on GitHub, or the advisory for a vulnerable dependency).
@@ -1064,7 +1538,7 @@ jobs:
           | --- | --- | --- | --- | --- | --- |
           ${FINDINGS_MD}
 
-          ## 7. Job Status
+          ## 9. Job Status
 
           | Job | Result |
           | --- | --- |
@@ -1074,13 +1548,13 @@ jobs:
           | SBOM | \`${R_SBOM}\` |
           | Repository Posture | \`${R_POSTURE}\` |
 
-          ## 8. Where To Look
+          ## 10. Where To Look
 
           1. Open **Security -> Code scanning alerts** for line-level findings.
           2. Open **Actions -> this run -> Artifacts** for raw SARIF and SBOM downloads.
           3. Use the SBOM artifacts for inventory, license, and supply-chain review.
 
-          ## 9. Reading The Results
+          ## 11. Reading The Results
 
           - Semgrep surfaces code patterns that may lead to security issues or insecure DOM handling.
           - Gitleaks checks for exposed credentials or tokens in git history.
@@ -1089,7 +1563,7 @@ jobs:
           - SBOM artifacts show what is in the build even when no alert is raised.
           - The risk grade and CVE enrichment (CISA KEV, FIRST EPSS) help triage which findings to fix first.
 
-          ## 10. Scan Map
+          ## 12. Scan Map
 
           \`\`\`mermaid
           flowchart LR
@@ -1268,6 +1742,17 @@ jobs:
               .grade-c { background: #a16207; }
               .grade-d { background: #c2410c; }
               .grade-f { background: #b91c1c; }
+              .alert {
+                border-left: 6px solid #b91c1c;
+                background: #fff5f5;
+              }
+              .alert h2 { color: #8a1c13; }
+              .subhead {
+                margin: 22px 0 4px;
+                font-size: 15px;
+                font-weight: 700;
+                color: var(--accent);
+              }
               .posture .pmeta { font-size: 14px; color: var(--muted); }
               .posture .pmeta strong { color: var(--ink); font-size: 16px; }
               .trend { margin-top: 12px; font-size: 14px; color: var(--muted); }
@@ -1298,6 +1783,8 @@ jobs:
                 </div>
               </section>
 
+              ${status_html}
+
               <section class="panel preface">
                 <h2>Preface</h2>
                 <p>This document is an automated security assessment produced by the
@@ -1310,7 +1797,9 @@ jobs:
                 <p><strong>Contents:</strong></p>
                 <ol>
                   <li>Scan &amp; Repository Overview</li>
+                  <li>Repository &amp; Code Profile</li>
                   <li>Risk Posture</li>
+                  <li>Scan Coverage</li>
                   <li>Findings Snapshot</li>
                   <li>Exploited &amp; High-Risk CVEs</li>
                   <li>Repository Posture (OpenSSF Scorecard)</li>
@@ -1351,10 +1840,78 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>2. Risk Posture</h2>
+                <h2>2. Repository &amp; Code Profile</h2>
+                <p class="sub">What is actually in this repository, measured from the checked-out
+                tree &mdash; enough to judge whether the scan had material to work with.</p>
+                <div class="grid">
+                  <div class="card"><div class="label">Files</div><div class="value">${prof_files}</div></div>
+                  <div class="card"><div class="label">Lines of text</div><div class="value">${prof_lines}</div></div>
+                  <div class="card"><div class="label">Tree size</div><div class="value">${prof_size}</div></div>
+                  <div class="card"><div class="label">Manifests</div><div class="value">${prof_dep}</div></div>
+                  <div class="card"><div class="label">Infra / CI files</div><div class="value">${prof_infra}</div></div>
+                  <div class="card"><div class="label">Commits</div><div class="value">${prof_commits}</div></div>
+                </div>
+
+                <div class="subhead">Language mix</div>
+                <div class="table-scroll">
+                  <table class="findings">
+                    <thead><tr><th>Language</th><th>Share</th></tr></thead>
+                    <tbody>
+                      ${lang_html}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="subhead">Code by file type (top 12 by lines)</div>
+                <div class="table-scroll">
+                  <table class="findings">
+                    <thead><tr><th>Extension</th><th>Files</th><th>Lines</th></tr></thead>
+                    <tbody>
+                      ${ext_html}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="subhead">Dependency &amp; infrastructure signals</div>
+                <div class="table-scroll">
+                  <table class="findings">
+                    <thead><tr><th>Signal</th><th>Kind</th><th>Files</th></tr></thead>
+                    <tbody>
+                      ${signal_html}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="subhead">Development activity</div>
+                <table>
+                  <tr><th>Contributors</th><td>${prof_contributors}</td></tr>
+                  <tr><th>Commits in the last 90 days</th><td>${prof_active}</td></tr>
+                  <tr><th>First commit</th><td>${prof_first}</td></tr>
+                  <tr><th>Latest commit</th><td>${prof_last} (<code>${prof_sha}</code>)</td></tr>
+                  <tr><th>Latest commit message</th><td>${prof_subject}</td></tr>
+                  <tr><th>Latest commit author</th><td>${prof_author}</td></tr>
+                  <tr><th>Top authors</th><td>${authors_line}</td></tr>
+                  <tr><th>Test directories</th><td>${prof_tests}</td></tr>
+                  <tr><th>Directories</th><td>${prof_dirs}</td></tr>
+                  <tr><th>Text files profiled</th><td>${prof_text}</td></tr>
+                </table>
+
+                <div class="subhead">Governance files</div>
+                <div class="table-scroll">
+                  <table class="findings">
+                    <thead><tr><th>File</th><th>Status</th></tr></thead>
+                    <tbody>
+                      ${gov_html}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="panel">
+                <h2>3. Risk Posture</h2>
                 <div class="posture">
                   <span class="grade ${grade_class}">${grade}</span>
-                  <span class="pmeta"><strong>${grade_word}</strong> &mdash; posture score ${score}/100<br>
+                  <span class="pmeta"><strong>${grade_word}</strong> &mdash; posture score ${score_display}<br>
                   Grade is capped by the worst severity present, so any Critical finding limits the report to a failing grade.</span>
                 </div>
                 <div class="grid">
@@ -1368,7 +1925,23 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>3. Findings Snapshot</h2>
+                <h2>4. Scan Coverage</h2>
+                <p class="sub">Every scanner, whether it ran, and what it had in front of it.
+                A zero in Findings means one of three different things &mdash; the scanner ran and
+                found nothing, it had nothing of its kind to look at, or it never ran. This table
+                says which.</p>
+                <div class="table-scroll">
+                  <table class="findings">
+                    <thead><tr><th>Scanner</th><th>Status</th><th>Findings</th><th>What it examined</th></tr></thead>
+                    <tbody>
+                      ${COVERAGE_HTML}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="panel">
+                <h2>5. Findings Snapshot</h2>
                 <div class="grid">
                   <div class="card"><div class="label">Semgrep</div><div class="value">${semgrep_count}</div></div>
                   <div class="card"><div class="label">Gitleaks</div><div class="value">${gitleaks_count}</div></div>
@@ -1380,7 +1953,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>4. Exploited &amp; High-Risk CVEs</h2>
+                <h2>6. Exploited &amp; High-Risk CVEs</h2>
                 <p class="sub">Of ${cve_total} unique CVEs across the dependency and image scans,
                 <strong>${kev_count}</strong> are in the CISA Known Exploited Vulnerabilities catalog and
                 <strong>${epss_hi_count}</strong> have an EPSS exploitation probability of 10% or higher.
@@ -1396,7 +1969,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>5. Repository Posture (OpenSSF Scorecard)</h2>
+                <h2>7. Repository Posture (OpenSSF Scorecard)</h2>
                 <p class="sub">Aggregate Scorecard: <strong>${scorecard_score}/10</strong>. These checks
                 reflect repository security hygiene &mdash; branch protection, dependency pinning,
                 dangerous workflows, maintenance &mdash; rather than findings in the code.</p>
@@ -1411,7 +1984,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>6. Detailed Findings</h2>
+                <h2>8. Detailed Findings</h2>
                 <p class="sub">Every issue each scanner reported, with a link to review it in
                 context &mdash; the source line on GitHub, or the advisory for a vulnerable dependency.</p>
                 <div class="table-scroll">
@@ -1427,7 +2000,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>7. Job Status</h2>
+                <h2>9. Job Status</h2>
                 <table>
                   <tr><th>Code And Secrets</th><td>${R_CODE}</td></tr>
                   <tr><th>Dependency And Supply Chain</th><td>${R_DEP}</td></tr>
@@ -1438,7 +2011,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>8. Where To Look</h2>
+                <h2>10. Where To Look</h2>
                 <ol>
                   <li>Open <code>Security -&gt; Code scanning alerts</code> for line-level issues.</li>
                   <li>Open <code>Actions -&gt; this run -&gt; Artifacts</code> for SARIF and SBOM files.</li>
@@ -1447,7 +2020,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>9. Reading The Results</h2>
+                <h2>11. Reading The Results</h2>
                 <ul>
                   <li>Semgrep checks application code and custom AI/ML guardrails.</li>
                   <li>Gitleaks checks git history for secrets.</li>
@@ -1482,7 +2055,7 @@ jobs:
           from: TIDHQ.NETWORK SecureCI <${{ secrets.mail_from || secrets.smtp_username }}>
           to: ${{ inputs.report_recipient || secrets.report_owner }}
           bcc: ${{ inputs.report_recipient != '' && secrets.report_owner || '' }}
-          subject: "TIDHQ.NETWORK | ${{ env.REPORT_NAME }} - ${{ needs.prepare.outputs.repository }} (Grade ${{ env.RISK_GRADE }}, ${{ env.TOTAL_FINDINGS }} findings)"
+          subject: "TIDHQ.NETWORK | ${{ env.REPORT_NAME }} - ${{ env.TARGET_LABEL }} (Grade ${{ env.RISK_GRADE }}, ${{ env.TOTAL_FINDINGS }} findings)${{ env.REPORT_FLAG }}"
           # Read the body from a file rather than inlining it. Passing the full
           # report HTML through an env var trips the 128 KB per-string exec limit
           # (MAX_ARG_STRLEN) on larger reports, which failed the send entirely.
@@ -1495,6 +2068,12 @@ jobs:
           {
             echo "## TID-SecureCI"
             echo
+            if [ -n "${{ env.REPORT_FLAG }}" ]; then
+              echo "> [!WARNING]"
+              echo "> This scan did not complete, so the findings counts are not a clean bill of health."
+              echo "> Check the Job Results table below and re-run the scan."
+              echo
+            fi
             echo "- Repository: \`${{ needs.prepare.outputs.repository }}\`"
             echo "- Ref: \`${{ needs.prepare.outputs.ref }}\`"
             echo "- Enforce mode: \`${{ inputs.enforce }}\`"
@@ -1517,6 +2096,14 @@ jobs:
             echo '  E --> G'
             echo '```'
             echo
+            if [ -s report/coverage_md.frag ]; then
+              echo "### Scan Coverage"
+              echo
+              echo "| Scanner | Status | Findings | What it examined |"
+              echo "| --- | --- | ---: | --- |"
+              cat report/coverage_md.frag
+              echo
+            fi
             echo "### What To Review"
             echo
             echo "1. Open **Security -> Code scanning alerts** for issue-by-issue findings."

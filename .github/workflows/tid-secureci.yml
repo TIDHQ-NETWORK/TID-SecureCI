@@ -767,13 +767,227 @@ jobs:
               | sed -E 's/^[[:space:]]*([0-9]+)[[:space:]]+(.*)$/\2\t\1/' > "${work}/authors.tsv" || true
           fi
 
-          languages="$(gh api "repos/${TARGET}/languages" 2>/dev/null || echo '{}')"
-          printf '%s' "${languages}" | jq empty >/dev/null 2>&1 || languages='{}'
+          # gh api writes its error body to stdout and exits non-zero, so the
+          # obvious `$(gh api ... || echo '{}')` yields the error object AND the
+          # fallback concatenated together. jq accepts a concatenated stream, so
+          # that slips past a plain `jq empty` check and only fails later at
+          # --argjson, taking the whole profile with it. Slurp to exactly one
+          # object and discard anything shaped like an API error.
+          languages="$(gh api "repos/${TARGET}/languages" 2>/dev/null \
+            | jq -c -s '(.[0] // {}) | if (type == "object" and (has("message") | not)) then . else {} end' 2>/dev/null)"
+          [ -z "${languages}" ] && languages='{}'
+
+          # ====================================================================
+          # Code overview: what this repository IS, not just how big it is.
+          # Everything below is derived from the checked-out tree, so it is
+          # reproducible, works on private targets and never sends repository
+          # contents anywhere.
+          # ====================================================================
+
+          # ---- README summary -------------------------------------------------
+          # First few lines of prose: drop headings, badges, raw HTML and rules.
+          readme_file=""
+          for cand in README.md README.rst README.txt README readme.md Readme.md docs/README.md; do
+            [ -f "${cand}" ] && { readme_file="${cand}"; break; }
+          done
+          readme_text=""
+          if [ -n "${readme_file}" ]; then
+            readme_text="$(sed -e 's/<[^>]*>//g' "${readme_file}" 2>/dev/null \
+              | grep -vE '^[[:space:]]*$|^[[:space:]]*#|^[[:space:]]*!\[|^[[:space:]]*\[!\[|^[[:space:]]*[-=*_]{3,}[[:space:]]*$|^[[:space:]]*\||^[[:space:]]*```' \
+              | head -n 8 | tr '\n' ' ' | sed 's/  */ /g' \
+              | iconv -c -f UTF-8 -t UTF-8 2>/dev/null | cut -c1-700)"
+          fi
+
+          # ---- Directory map with inferred roles ------------------------------
+          dir_role() {
+            case "$1" in
+              src|lib|libs|app|apps|source|pkg|internal|core)   echo "application code" ;;
+              test|tests|spec|specs|__tests__|testing|e2e)      echo "tests" ;;
+              doc|docs|documentation|man)                       echo "documentation" ;;
+              .github)                                          echo "CI and GitHub config" ;;
+              infra|infrastructure|terraform|deploy|deployment|k8s|kubernetes|charts|helm|ansible)
+                                                                echo "infrastructure" ;;
+              script|scripts|bin|tools|tooling|hack|utils)      echo "scripts and tooling" ;;
+              example|examples|samples|demo|demos)              echo "examples" ;;
+              migration|migrations|db|database)                 echo "database and migrations" ;;
+              api|apis|handlers|routes|controllers|endpoints|views)
+                                                                echo "API and request handlers" ;;
+              asset|assets|static|public|www|media|images)      echo "static assets" ;;
+              vendor|node_modules|third_party|thirdparty|external|deps)
+                                                                echo "vendored dependencies" ;;
+              config|configs|conf|settings|etc)                 echo "configuration" ;;
+              cmd|cmds)                                         echo "command entry points" ;;
+              web|frontend|ui|client|www-client)                echo "frontend" ;;
+              server|backend|service|services)                  echo "backend services" ;;
+              proto|protos|schema|schemas|idl)                  echo "schemas and interface definitions" ;;
+              data|fixtures|testdata|samples-data)              echo "data and fixtures" ;;
+              locale|locales|i18n|translations)                 echo "translations" ;;
+              "(root files)")                                   echo "top-level files" ;;
+              *)                                                echo "" ;;
+            esac
+          }
+
+          # Roll the per-file line counts up to their top-level directory.
+          awk '
+            { n=$1; $1=""; sub(/^[ \t]+/,""); p=$0; sub(/^\.\//,"",p)
+              if (index(p,"/") > 0) { d = substr(p, 1, index(p,"/")-1) } else { d = "(root files)" }
+              f[d]++; l[d]+=n }
+            END { for (d in f) printf "%s\t%d\t%d\n", d, f[d], l[d] }
+          ' "${work}/wc.txt" 2>/dev/null | sort -t"$(printf '\t')" -k3,3nr | head -n 14 > "${work}/dirsraw.tsv"
+
+          : > "${work}/dirs.tsv"
+          while IFS="$(printf '\t')" read -r dname dfiles dlines; do
+            [ -n "${dname}" ] || continue
+            printf '%s\t%s\t%s\t%s\n' "${dname}" "$(dir_role "${dname}")" "${dfiles}" "${dlines}" >> "${work}/dirs.tsv"
+          done < "${work}/dirsraw.tsv"
+
+          # ---- Entry points and network surface -------------------------------
+          : > "${work}/entry.tsv"
+          ent() { printf '%s\t%s\n' "$1" "$(printf '%s' "$2" | cut -c1-180)" >> "${work}/entry.tsv"; }
+          first_match() {
+            find . -path ./.git -prune -o -path '*/node_modules' -prune -o -type f -name "$1" -print 2>/dev/null \
+              | head -n1 | sed 's#^\./##'
+          }
+
+          for n in main.py __main__.py manage.py wsgi.py asgi.py; do
+            m="$(first_match "${n}")"
+            [ -n "${m}" ] && ent "Python" "${m}"
+          done
+          gomain="$(first_match 'main.go')"; [ -n "${gomain}" ] && ent "Go" "${gomain}"
+          [ -f src/main.rs ] && ent "Rust" "src/main.rs"
+          [ -f src/lib.rs ] && ent "Rust library" "src/lib.rs"
+
+          pj="$(first_match 'package.json')"
+          if [ -n "${pj}" ]; then
+            jq -r '(.main // empty) | tostring' "${pj}" 2>/dev/null | head -n1 \
+              | while IFS= read -r v; do [ -n "${v}" ] && ent "Node entry" "${v}"; done
+            jq -r '(.bin // {}) | if type == "string" then . else (to_entries | map(.key + " -> " + (.value|tostring)) | join(", ")) end' "${pj}" 2>/dev/null | head -n1 \
+              | while IFS= read -r v; do [ -n "${v}" ] && [ "${v}" != "null" ] && ent "CLI (npm bin)" "${v}"; done
+            jq -r '(.scripts.start // empty) | tostring' "${pj}" 2>/dev/null | head -n1 \
+              | while IFS= read -r v; do [ -n "${v}" ] && ent "npm start" "${v}"; done
+          fi
+
+          pyproj="$(first_match 'pyproject.toml')"
+          if [ -n "${pyproj}" ]; then
+            sed -n '/^\[project\.scripts\]/,/^\[/p' "${pyproj}" 2>/dev/null \
+              | grep -E '^[A-Za-z0-9_.-]+[[:space:]]*=' | head -n 3 \
+              | while IFS= read -r v; do ent "CLI (pyproject)" "${v}"; done
+          fi
+
+          dfile="$(first_match 'Dockerfile')"
+          if [ -n "${dfile}" ]; then
+            dcmd="$(grep -iE '^[[:space:]]*(ENTRYPOINT|CMD)[[:space:]]' "${dfile}" 2>/dev/null | tail -n1 | sed 's/^[[:space:]]*//')"
+            [ -n "${dcmd}" ] && ent "Container" "${dcmd}"
+            dports="$(grep -ihE '^[[:space:]]*EXPOSE[[:space:]]' "${dfile}" 2>/dev/null | sed -E 's/^[[:space:]]*[Ee][Xx][Pp][Oo][Ss][Ee][[:space:]]+//' | tr '\n' ' ')"
+            [ -n "${dports}" ] && ent "Listening ports (EXPOSE)" "${dports}"
+          fi
+
+          for c in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+            cf="$(first_match "${c}")"
+            [ -n "${cf}" ] || continue
+            cports="$(grep -oE '"?[0-9]{2,5}:[0-9]{2,5}"?' "${cf}" 2>/dev/null | tr -d '"' | sort -u | tr '\n' ' ')"
+            [ -n "${cports}" ] && ent "Published ports (compose)" "${cports}"
+          done
+
+          # ---- Frameworks, read from declared dependencies --------------------
+          # Manifest contents rather than source imports: dependency names are
+          # unambiguous, whereas words like "next" or "echo" appear in prose.
+          : > "${work}/manifests.txt"
+          find . -path ./.git -prune -o -path '*/node_modules' -prune -o -type f \
+            \( -name 'requirements*.txt' -o -name 'pyproject.toml' -o -name 'Pipfile' \
+               -o -name 'setup.py' -o -name 'package.json' -o -name 'go.mod' \
+               -o -name 'Cargo.toml' -o -name 'pom.xml' -o -name 'build.gradle*' \
+               -o -name 'Gemfile' -o -name 'composer.json' \) -print0 2>/dev/null \
+            | xargs -0 -r cat >> "${work}/manifests.txt" 2>/dev/null || true
+
+          : > "${work}/fw.txt"
+          web_fw=0
+          fw() {
+            grep -qiE -- "$1" "${work}/manifests.txt" 2>/dev/null || return 0
+            echo "$2" >> "${work}/fw.txt"
+            [ "${3:-}" = "web" ] && web_fw=1
+            return 0
+          }
+          fw '"?fastapi' 'FastAPI' web
+          fw '"?flask' 'Flask' web
+          fw '"?django' 'Django' web
+          fw '"?(aiohttp|tornado|sanic|starlette)' 'Python async web framework' web
+          fw '"?express"' 'Express' web
+          fw '"?(koa|fastify|@nestjs|next)"' 'Node web framework' web
+          fw '"?(react|vue|svelte|@angular)"' 'Frontend framework'
+          fw 'gin-gonic|labstack/echo|gofiber' 'Go web framework' web
+          fw 'actix-web|axum|rocket' 'Rust web framework' web
+          fw 'springframework|spring-boot' 'Spring' web
+          fw '"?(sqlalchemy|prisma|typeorm|sequelize|gorm)' 'ORM'
+          fw '"?(celery|sidekiq|bullmq)' 'Background job queue'
+          fw '"?(torch|tensorflow|transformers|scikit-learn|keras|onnxruntime)' 'Machine learning stack'
+          fw '"?(langchain|llama-index|openai|anthropic)' 'LLM / AI SDK'
+          fw '"?(boto3|google-cloud|azure-|@aws-sdk)' 'Cloud SDK'
+          fw '"?(pytest|jest|mocha|vitest|junit|rspec)' 'Test framework'
+          sort -u "${work}/fw.txt" -o "${work}/fw.txt" 2>/dev/null || true
+
+          # ---- Build and run commands -----------------------------------------
+          : > "${work}/cmds.tsv"
+          cmd_row() { printf '%s\t%s\n' "$1" "$(printf '%s' "$2" | cut -c1-140)" >> "${work}/cmds.tsv"; }
+          mkfile="$(first_match 'Makefile')"
+          if [ -n "${mkfile}" ]; then
+            grep -oE '^[a-zA-Z0-9_][a-zA-Z0-9_.-]*:' "${mkfile}" 2>/dev/null | tr -d ':' | head -n 6 \
+              | while IFS= read -r t; do cmd_row "make ${t}" "Makefile target"; done
+          fi
+          if [ -n "${pj}" ]; then
+            jq -r '(.scripts // {}) | to_entries[]? | "npm run " + .key + "\t" + (.value|tostring)' "${pj}" 2>/dev/null \
+              | head -n 6 >> "${work}/cmds.tsv"
+          fi
+          [ -n "${dfile}" ] && cmd_row "docker build -f ${dfile} ." "Container image build"
+          [ -f tox.ini ] && cmd_row "tox" "Python test matrix"
+          [ -f Cargo.toml ] && cmd_row "cargo build --release" "Rust build"
+          [ -f go.mod ] && cmd_row "go build ./..." "Go build"
+
+          # ---- Where the complexity lives -------------------------------------
+          awk '{ n=$1; $1=""; sub(/^[ \t]+/,""); p=$0; sub(/^\.\//,"",p); printf "%d\t%s\n", n, p }' \
+            "${work}/wc.txt" 2>/dev/null \
+            | grep -vE '/(node_modules|vendor|third_party|dist|build|\.venv|site-packages)/' \
+            | grep -vE '\.(lock|map|svg|csv|tsv|json|md|rst|adoc|txt|po|pot|html)$|[.-]min\.(js|css)$' \
+            | sort -k1,1nr | head -n 10 > "${work}/biggest.tsv"
+
+          # ---- One-line classification ----------------------------------------
+          top_lang="$(printf '%s' "${languages}" | jq -r 'to_entries | sort_by(-.value) | .[0].key // ""' 2>/dev/null)"
+          if [ -z "${top_lang}" ]; then
+            # No languages from the API (private target, rate limit, 404):
+            # fall back to the largest CODE extension, ignoring docs and config
+            # so a documentation-heavy repo is not called a "Markdown project".
+            ext_lang() {
+              case "$1" in
+                .py) echo Python ;; .js|.mjs|.cjs) echo JavaScript ;; .ts|.tsx) echo TypeScript ;;
+                .go) echo Go ;; .rs) echo Rust ;; .java) echo Java ;; .kt) echo Kotlin ;;
+                .rb) echo Ruby ;; .php) echo PHP ;; .cs) echo "C#" ;; .c|.h) echo C ;;
+                .cpp|.cc|.cxx|.hpp) echo "C++" ;; .sh|.bash) echo Shell ;; .swift) echo Swift ;;
+                .scala) echo Scala ;; .lua) echo Lua ;; .pl|.pm) echo Perl ;; .ex|.exs) echo Elixir ;;
+                .dart) echo Dart ;; .r|.R) echo R ;; .jl) echo Julia ;; .vue|.svelte) echo JavaScript ;;
+                *) echo "" ;;
+              esac
+            }
+            while IFS="$(printf '\t')" read -r e _ _; do
+              cand="$(ext_lang "${e}")"
+              [ -n "${cand}" ] && { top_lang="${cand}"; break; }
+            done < "${work}/ext.tsv"
+          fi
+          [ -z "${top_lang}" ] && top_lang="Unclassified"
+          kind_text="${top_lang} repository"
+          [ "${web_fw}" -eq 1 ] && kind_text="${kind_text}, exposes an HTTP service"
+          grep -qiE '^(CLI|npm start)' "${work}/entry.tsv" 2>/dev/null && kind_text="${kind_text}, ships a command-line entry point"
+          [ -n "${dfile}" ] && kind_text="${kind_text}, containerised"
+          [ "${test_dirs}" -gt 0 ] && kind_text="${kind_text}, has a test suite"
 
           tsv_json() { jq -R -s -c "$1" "$2" 2>/dev/null || echo '[]'; }
           exts_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{ext:.[0],files:(.[1]|tonumber),lines:(.[2]|tonumber)})' "${work}/ext.tsv")"
           signals_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{kind:.[0],label:.[1],count:(.[2]|tonumber)})' "${work}/signals.tsv")"
           authors_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{name:.[0],commits:(.[1]|tonumber)})' "${work}/authors.tsv")"
+          dirs_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{path:.[0],role:.[1],files:(.[2]|tonumber),lines:(.[3]|tonumber)})' "${work}/dirs.tsv")"
+          entry_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{kind:.[0],detail:(.[1]//"")})' "${work}/entry.tsv")"
+          cmds_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{cmd:.[0],note:(.[1]//"")})' "${work}/cmds.tsv")"
+          biggest_json="$(tsv_json 'split("\n")|map(select(length>0)|split("\t")|{lines:(.[0]|tonumber),path:(.[1]//"")})' "${work}/biggest.tsv")"
+          fw_json="$(tsv_json 'split("\n")|map(select(length>0))' "${work}/fw.txt")"
 
           cd - >/dev/null
 
@@ -805,6 +1019,14 @@ jobs:
             --argjson gov_contrib "${gov_contrib}" \
             --argjson gov_owners "${gov_owners}" \
             --argjson gov_gitignore "${gov_gitignore}" \
+            --argjson ov_dirs "${dirs_json}" \
+            --argjson ov_entry "${entry_json}" \
+            --argjson ov_cmds "${cmds_json}" \
+            --argjson ov_biggest "${biggest_json}" \
+            --argjson ov_frameworks "${fw_json}" \
+            --arg ov_readme "${readme_text}" \
+            --arg ov_readme_file "${readme_file}" \
+            --arg ov_kind "${kind_text}" \
             '{
                files_total: $files_total, dirs_total: $dirs_total, size_kb: $size_kb,
                text_files: $text_files, total_lines: $total_lines,
@@ -817,7 +1039,10 @@ jobs:
                       last_sha: $last_sha, authors: $authors },
                governance: { readme: $gov_readme, license: $gov_license, security: $gov_security,
                              contributing: $gov_contrib, codeowners: $gov_owners,
-                             gitignore: $gov_gitignore }
+                             gitignore: $gov_gitignore },
+               overview: { kind: $ov_kind, readme: $ov_readme, readme_file: $ov_readme_file,
+                           dirs: $ov_dirs, entrypoints: $ov_entry, commands: $ov_cmds,
+                           biggest: $ov_biggest, frameworks: $ov_frameworks }
              }' > results/inventory.json
 
           echo "Profiled ${files_total} files, ${total_lines} lines of text."
@@ -1253,8 +1478,15 @@ jobs:
           [ -z "${link_ref}" ] && link_ref="HEAD"
 
           # ---- Repository metadata (best-effort; public repos via the API) ----
+          # Slurped to exactly one object: gh api prints its error body to
+          # stdout, so an `|| echo '{}'` fallback would concatenate two objects
+          # and every field below would then render twice.
           repo_json='{}'
-          [ -n "${link_repo}" ] && repo_json="$(gh api "repos/${link_repo}" 2>/dev/null || echo '{}')"
+          if [ -n "${link_repo}" ]; then
+            repo_json="$(gh api "repos/${link_repo}" 2>/dev/null \
+              | jq -c -s '(.[0] // {}) | if (type == "object" and (has("message") | not)) then . else {} end' 2>/dev/null)"
+            [ -z "${repo_json}" ] && repo_json='{}'
+          fi
           rj() { printf '%s' "${repo_json}" | jq -r "$1" 2>/dev/null; }
           repo_url="$(rj '.html_url // ""')"
           [ -z "${repo_url}" ] && repo_url="https://github.com/${link_repo}"
@@ -1366,6 +1598,62 @@ jobs:
           [ -z "${signal_md}" ] && signal_md='| — | — | No dependency manifests or infrastructure files detected. |'
           [ -z "${gov_html}" ] && gov_html='<tr><td colspan="2">Repository governance files could not be inspected.</td></tr>'
           [ -z "${gov_md}" ] && gov_md='| — | Repository governance files could not be inspected. |'
+
+          # ---- Code overview: what the repository IS --------------------------
+          ov_kind="Repository contents were not available to profile"
+          ov_readme=""; ov_readme_raw=""; ov_readme_file=""; ov_frameworks="—"
+          ov_dirs_html=""; ov_dirs_md=""; ov_entry_html=""; ov_entry_md=""
+          ov_cmds_html=""; ov_cmds_md=""; ov_big_html=""; ov_big_md=""
+          if [ "${have_inv}" = "true" ] && jq -e '.overview? != null' "${inv}" >/dev/null 2>&1; then
+            ov_kind="$(iv '(.overview.kind | select(length>0)) // "—"')"
+            ov_readme="$(iv '((.overview.readme | select(length>0)) // "") | @html')"
+            ov_readme_raw="$(iv '((.overview.readme | select(length>0)) // "")')"
+            ov_readme_file="$(iv '(.overview.readme_file | select(length>0)) // ""')"
+            ov_frameworks="$(iv '((.overview.frameworks // []) | join(", ")) | if length > 0 then . else "none identified from the dependency manifests" end')"
+
+            ov_dirs_html="$(iv '(.overview.dirs // [])
+              | map("<tr><td><code>" + (.path|@html) + "</code></td><td>" + (if .role == "" then "&mdash;" else (.role|@html) end)
+                    + "</td><td>" + (.files|tostring) + "</td><td>" + (.lines|tostring) + "</td></tr>") | join("\n")')"
+            ov_dirs_md="$(iv '(.overview.dirs // [])
+              | map("| `" + .path + "` | " + (if .role == "" then "—" else .role end)
+                    + " | " + (.files|tostring) + " | " + (.lines|tostring) + " |") | join("\n")')"
+
+            ov_entry_html="$(iv '(.overview.entrypoints // [])
+              | map("<tr><td>" + (.kind|@html) + "</td><td><code>" + (.detail|@html) + "</code></td></tr>") | join("\n")')"
+            ov_entry_md="$(iv '(.overview.entrypoints // [])
+              | map("| " + .kind + " | `" + (.detail | gsub("\\|"; "\\\\|")) + "` |") | join("\n")')"
+
+            ov_cmds_html="$(iv '(.overview.commands // [])
+              | map("<tr><td><code>" + (.cmd|@html) + "</code></td><td>" + (.note|@html) + "</td></tr>") | join("\n")')"
+            ov_cmds_md="$(iv '(.overview.commands // [])
+              | map("| `" + .cmd + "` | " + (.note | gsub("\\|"; "\\\\|")) + " |") | join("\n")')"
+
+            ov_big_html="$(iv '(.overview.biggest // [])
+              | map("<tr><td><code>" + (.path|@html) + "</code></td><td>" + (.lines|tostring) + "</td></tr>") | join("\n")')"
+            ov_big_md="$(iv '(.overview.biggest // [])
+              | map("| `" + .path + "` | " + (.lines|tostring) + " |") | join("\n")')"
+          fi
+          [ -z "${ov_frameworks}" ] && ov_frameworks="—"
+          [ -z "${ov_dirs_html}" ] && ov_dirs_html='<tr><td colspan="4">The repository layout could not be inspected.</td></tr>'
+          [ -z "${ov_dirs_md}" ] && ov_dirs_md='| — | — | — | The repository layout could not be inspected. |'
+          [ -z "${ov_entry_html}" ] && ov_entry_html='<tr><td colspan="2">No entry point was identified &mdash; this looks like a library or a collection of files rather than a runnable application.</td></tr>'
+          [ -z "${ov_entry_md}" ] && ov_entry_md='| — | No entry point identified — likely a library rather than a runnable application. |'
+          [ -z "${ov_cmds_html}" ] && ov_cmds_html='<tr><td colspan="2">No build or test commands were discovered.</td></tr>'
+          [ -z "${ov_cmds_md}" ] && ov_cmds_md='| — | No build or test commands were discovered. |'
+          [ -z "${ov_big_html}" ] && ov_big_html='<tr><td colspan="2">No source files were profiled.</td></tr>'
+          [ -z "${ov_big_md}" ] && ov_big_md='| — | No source files were profiled. |'
+
+          # README prose is quoted from the target repository. It is escaped and
+          # never interpreted, so nothing in a scanned repo can style the report.
+          if [ -n "${ov_readme}" ]; then
+            ov_readme_html="<blockquote class=\"quoted\">${ov_readme}</blockquote><p class=\"sub\">Quoted from <code>${ov_readme_file}</code> in the target repository.</p>"
+            ov_readme_md="> ${ov_readme_raw}
+
+          Quoted from \`${ov_readme_file}\` in the target repository."
+          else
+            ov_readme_html='<p class="sub">No README prose was found in this repository.</p>'
+            ov_readme_md="No README prose was found in this repository."
+          fi
 
           # ---- Scan coverage: what each scanner actually had to work with -----
           # This is the section that distinguishes "nothing to find" from
@@ -1501,19 +1789,20 @@ jobs:
           ## Table of Contents
 
           1. Scan & Repository Overview
-          2. Repository & Code Profile
-          3. Risk Posture
-          4. Fix This First
-          5. Scan Coverage
-          6. Findings Snapshot
-          7. Exploited & High-Risk CVEs
-          8. Software Bill of Materials
-          9. Repository Posture (OpenSSF Scorecard)
-          10. Detailed Findings
-          11. Job Status
-          12. Where To Look
-          13. Reading The Results
-          14. Scan Map
+          2. What This Code Is
+          3. Repository & Code Profile
+          4. Risk Posture
+          5. Fix This First
+          6. Scan Coverage
+          7. Findings Snapshot
+          8. Exploited & High-Risk CVEs
+          9. Software Bill of Materials
+          10. Repository Posture (OpenSSF Scorecard)
+          11. Detailed Findings
+          12. Job Status
+          13. Where To Look
+          14. Reading The Results
+          15. Scan Map
 
           ---------------------------------------------------------------
 
@@ -1538,7 +1827,52 @@ jobs:
 
           **Quick links:** [Code](${repo_url}) &middot; [Issues](${repo_url}/issues) &middot; [Pull requests](${repo_url}/pulls) &middot; [Commits](${repo_url}/commits) &middot; [Security](${repo_url}/security) &middot; [Dependency graph](${repo_url}/network/dependencies)
 
-          ## 2. Repository & Code Profile
+          ## 2. What This Code Is
+
+          **${ov_kind}.**
+
+          ### Overview
+
+          ${ov_readme_md}
+
+          ### Frameworks and libraries in use
+
+          ${ov_frameworks}
+
+          Read from the declared dependencies in the manifests, not from prose,
+          so the names are what the project actually pulls in.
+
+          ### Repository structure
+
+          | Path | Role | Files | Lines |
+          | --- | --- | ---: | ---: |
+          ${ov_dirs_md}
+
+          ### Entry points and network surface
+
+          Where execution starts and where the code listens. These are the places
+          untrusted input reaches this software first.
+
+          | Kind | Detail |
+          | --- | --- |
+          ${ov_entry_md}
+
+          ### How it is built and run
+
+          | Command | Source |
+          | --- | --- |
+          ${ov_cmds_md}
+
+          ### Where the complexity lives
+
+          The largest source files, excluding vendored, generated and minified
+          code. Concentrated complexity is where defects and review effort go.
+
+          | File | Lines |
+          | --- | ---: |
+          ${ov_big_md}
+
+          ## 3. Repository & Code Profile
 
           What is actually in this repository, measured from the checked-out tree.
           Use it to judge whether the scan had enough material to be meaningful.
@@ -1592,7 +1926,7 @@ jobs:
           | --- | --- |
           ${gov_md}
 
-          ## 3. Risk Posture
+          ## 4. Risk Posture
 
           **Overall grade: ${grade} (${grade_word}) &mdash; posture score ${score_display}**
 
@@ -1616,7 +1950,7 @@ jobs:
 
           **Trend:** ${trend_text}
 
-          ## 4. Fix This First
+          ## 5. Fix This First
 
           ${fixable_count} of the ${total_count} findings have a published fixed
           version. They are ordered by real-world risk: actively exploited (CISA
@@ -1627,7 +1961,7 @@ jobs:
           | --- | --- | --- | --- | ---: | --- | ---: |
           ${fix_md}
 
-          ## 5. Scan Coverage
+          ## 6. Scan Coverage
 
           Every scanner, whether it ran, and what it had in front of it. A zero in
           the Findings column means one of three different things &mdash; the
@@ -1638,7 +1972,7 @@ jobs:
           | --- | --- | ---: | --- |
           ${COVERAGE_MD}
 
-          ## 6. Findings Snapshot
+          ## 7. Findings Snapshot
 
           | Scanner | Findings in artifact |
           | --- | ---: |
@@ -1654,7 +1988,7 @@ jobs:
           Per-scanner counts are raw artifact contents. The unique total is what
           the risk grade is calculated from.
 
-          ## 7. Exploited & High-Risk CVEs
+          ## 8. Exploited & High-Risk CVEs
 
           Of ${cve_total} unique CVEs across the dependency and image scans,
           ${kev_count} are in the CISA Known Exploited Vulnerabilities catalog and
@@ -1665,7 +1999,7 @@ jobs:
           | --- | --- | ---: |
           ${cve_md}
 
-          ## 8. Software Bill of Materials
+          ## 9. Software Bill of Materials
 
           The SBOM records what this software is actually made of, independent of
           whether any scanner raised an alert. **${sbom_total} packages** were
@@ -1682,7 +2016,7 @@ jobs:
           | --- | ---: |
           ${sbom_lic_md}
 
-          ## 9. Repository Posture (OpenSSF Scorecard)
+          ## 10. Repository Posture (OpenSSF Scorecard)
 
           **Aggregate Scorecard: ${scorecard_score}/10.** Scores reflect repository
           security hygiene (branch protection, dependency pinning, dangerous
@@ -1692,7 +2026,7 @@ jobs:
           | --- | --- | --- |
           ${scorecard_md}
 
-          ## 10. Detailed Findings
+          ## 11. Detailed Findings
 
           Every issue each scanner reported, with a link to review it in context
           (source line on GitHub, or the advisory for a vulnerable dependency).
@@ -1701,7 +2035,7 @@ jobs:
           | --- | --- | --- | --- | --- | --- |
           ${FINDINGS_MD}
 
-          ## 11. Job Status
+          ## 12. Job Status
 
           | Job | Result |
           | --- | --- |
@@ -1711,13 +2045,13 @@ jobs:
           | SBOM | \`${R_SBOM}\` |
           | Repository Posture | \`${R_POSTURE}\` |
 
-          ## 12. Where To Look
+          ## 13. Where To Look
 
           1. Open **Security -> Code scanning alerts** for line-level findings.
           2. Open **Actions -> this run -> Artifacts** for raw SARIF and SBOM downloads.
           3. Use the SBOM artifacts for inventory, license, and supply-chain review.
 
-          ## 13. Reading The Results
+          ## 14. Reading The Results
 
           - Semgrep surfaces code patterns that may lead to security issues or insecure DOM handling.
           - Gitleaks checks for exposed credentials or tokens in git history.
@@ -1726,7 +2060,7 @@ jobs:
           - SBOM artifacts show what is in the build even when no alert is raised.
           - The risk grade and CVE enrichment (CISA KEV, FIRST EPSS) help triage which findings to fix first.
 
-          ## 14. Scan Map
+          ## 15. Scan Map
 
           \`\`\`mermaid
           flowchart LR
@@ -1913,6 +2247,20 @@ jobs:
                 border-left: 6px solid #b91c1c;
                 background: #fff5f5;
               }
+              blockquote.quoted {
+                margin: 8px 0;
+                padding: 10px 16px;
+                border-left: 4px solid var(--line);
+                background: #f7fbf6;
+                color: var(--muted);
+                font-size: 14px;
+              }
+              .kindline {
+                font-size: 17px;
+                font-weight: 700;
+                color: var(--accent);
+                margin: 0 0 6px;
+              }
               .alert h2 { color: #8a1c13; }
               .subhead {
                 margin: 22px 0 4px;
@@ -1964,6 +2312,7 @@ jobs:
                 <p><strong>Contents:</strong></p>
                 <ol>
                   <li>Scan &amp; Repository Overview</li>
+                  <li>What This Code Is</li>
                   <li>Repository &amp; Code Profile</li>
                   <li>Risk Posture</li>
                   <li>Fix This First</li>
@@ -2009,7 +2358,62 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>2. Repository &amp; Code Profile</h2>
+                <h2>2. What This Code Is</h2>
+                <p class="kindline">${ov_kind}.</p>
+                ${ov_readme_html}
+
+                <div class="subhead">Frameworks and libraries in use</div>
+                <p class="sub">${ov_frameworks}</p>
+                <p class="sub">Read from the declared dependencies in the manifests, not from
+                prose, so the names are what the project actually pulls in.</p>
+
+                <div class="subhead">Repository structure</div>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>Path</th><th>Role</th><th>Files</th><th>Lines</th></tr></thead>
+                    <tbody>
+                      ${ov_dirs_html}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="subhead">Entry points and network surface</div>
+                <p class="sub">Where execution starts and where the code listens &mdash; the places
+                untrusted input reaches this software first.</p>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>Kind</th><th>Detail</th></tr></thead>
+                    <tbody>
+                      ${ov_entry_html}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="subhead">How it is built and run</div>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>Command</th><th>Source</th></tr></thead>
+                    <tbody>
+                      ${ov_cmds_html}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="subhead">Where the complexity lives</div>
+                <p class="sub">The largest source files, excluding vendored, generated and minified
+                code. Concentrated complexity is where defects and review effort go.</p>
+                <div class="table-scroll">
+                  <table class="findings fixtable">
+                    <thead><tr><th>File</th><th>Lines</th></tr></thead>
+                    <tbody>
+                      ${ov_big_html}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="panel">
+                <h2>3. Repository &amp; Code Profile</h2>
                 <p class="sub">What is actually in this repository, measured from the checked-out
                 tree &mdash; enough to judge whether the scan had material to work with.</p>
                 <div class="grid">
@@ -2077,7 +2481,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>3. Risk Posture</h2>
+                <h2>4. Risk Posture</h2>
                 <div class="posture">
                   <span class="grade ${grade_class}">${grade}</span>
                   <span class="pmeta"><strong>${grade_word}</strong> &mdash; posture score ${score_display}<br>
@@ -2098,7 +2502,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>4. Fix This First</h2>
+                <h2>5. Fix This First</h2>
                 <p class="sub">${fixable_count} of the ${total_count} findings have a published
                 fixed version. Ordered by real-world risk: actively exploited (CISA KEV) first,
                 then by EPSS exploitation probability, then by severity. Top 25.</p>
@@ -2113,7 +2517,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>5. Scan Coverage</h2>
+                <h2>6. Scan Coverage</h2>
                 <p class="sub">Every scanner, whether it ran, and what it had in front of it.
                 A zero in Findings means one of three different things &mdash; the scanner ran and
                 found nothing, it had nothing of its kind to look at, or it never ran. This table
@@ -2129,7 +2533,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>6. Findings Snapshot</h2>
+                <h2>7. Findings Snapshot</h2>
                 <div class="grid">
                   <div class="card"><div class="label">Semgrep</div><div class="value">${semgrep_count}</div></div>
                   <div class="card"><div class="label">Gitleaks</div><div class="value">${gitleaks_count}</div></div>
@@ -2144,7 +2548,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>7. Exploited &amp; High-Risk CVEs</h2>
+                <h2>8. Exploited &amp; High-Risk CVEs</h2>
                 <p class="sub">Of ${cve_total} unique CVEs across the dependency and image scans,
                 <strong>${kev_count}</strong> are in the CISA Known Exploited Vulnerabilities catalog and
                 <strong>${epss_hi_count}</strong> have an EPSS exploitation probability of 10% or higher.
@@ -2160,7 +2564,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>8. Software Bill of Materials</h2>
+                <h2>9. Software Bill of Materials</h2>
                 <p class="sub">What this software is made of, independent of whether any scanner
                 raised an alert. Full SPDX and CycloneDX files are attached to the run.</p>
                 <div class="grid">
@@ -2194,7 +2598,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>9. Repository Posture (OpenSSF Scorecard)</h2>
+                <h2>10. Repository Posture (OpenSSF Scorecard)</h2>
                 <p class="sub">Aggregate Scorecard: <strong>${scorecard_score}/10</strong>. These checks
                 reflect repository security hygiene &mdash; branch protection, dependency pinning,
                 dangerous workflows, maintenance &mdash; rather than findings in the code.</p>
@@ -2209,7 +2613,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>10. Detailed Findings</h2>
+                <h2>11. Detailed Findings</h2>
                 <p class="sub">Every issue each scanner reported, with a link to review it in
                 context &mdash; the source line on GitHub, or the advisory for a vulnerable dependency.</p>
                 <div class="table-scroll">
@@ -2225,7 +2629,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>11. Job Status</h2>
+                <h2>12. Job Status</h2>
                 <table>
                   <tr><th>Code And Secrets</th><td>${R_CODE}</td></tr>
                   <tr><th>Dependency And Supply Chain</th><td>${R_DEP}</td></tr>
@@ -2236,7 +2640,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>12. Where To Look</h2>
+                <h2>13. Where To Look</h2>
                 <ol>
                   <li>Open <code>Security -&gt; Code scanning alerts</code> for line-level issues.</li>
                   <li>Open <code>Actions -&gt; this run -&gt; Artifacts</code> for SARIF and SBOM files.</li>
@@ -2245,7 +2649,7 @@ jobs:
               </section>
 
               <section class="panel">
-                <h2>13. Reading The Results</h2>
+                <h2>14. Reading The Results</h2>
                 <ul>
                   <li>Semgrep checks application code and custom AI/ML guardrails.</li>
                   <li>Gitleaks checks git history for secrets.</li>

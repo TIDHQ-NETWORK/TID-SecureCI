@@ -79,6 +79,11 @@ gh run download "$RUN" -R TIDHQ-NETWORK/TID-SecureCI
 When it finishes you get:
 
 - 📧 an **emailed report** (branded HTML + Markdown) containing:
+  - **What This Code Is** — a plain read of the repository: what it is, the README
+    summary, frameworks in use, the directory layout with each folder's role, entry
+    points and listening ports, how it is built and run, and which files hold the
+    most code. Derived entirely from the checked-out tree, so it works on private
+    targets and sends nothing anywhere;
   - **Repository & Code Profile** — language mix, size, code volume by file type,
     dependency and infrastructure signals, commit activity, governance files;
   - **Risk Posture** — grade and severity breakdown over *deduplicated* findings

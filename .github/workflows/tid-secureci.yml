@@ -1944,9 +1944,13 @@ jobs:
           }
 
           sec "Scan & Repository Overview";  n_overview="${SEC}"
-          n_code=""; n_profile=""
+          # "What This Code Is" is always present. It is the section that says
+          # what the target actually is, so it must never silently disappear:
+          # if the profile could not be built, it says so and names the job to
+          # look at, which is far more useful than the section vanishing.
+          sec "What This Code Is";           n_code="${SEC}"
+          n_profile=""
           if [ "${have_inv}" = "true" ]; then
-            sec "What This Code Is";         n_code="${SEC}"
             sec "Repository & Code Profile"; n_profile="${SEC}"
           fi
           sec "Risk Posture";                n_risk="${SEC}"
@@ -1970,27 +1974,44 @@ jobs:
           TOC_MD="$(cat toc_md.frag)"
           TOC_HTML="$(cat toc_html.frag)"
 
-          sec_code_md=""; sec_code_html=""
-          sec_profile_md=""; sec_profile_html=""
-          if [ "${have_inv}" = "true" ]; then
-            sec_code_md="$(cat <<XEOF
+          # Headline line, and the explanation shown in its place when the
+          # profile job did not deliver an inventory to describe.
+          ov_kind_md=""; ov_kind_html=""
+          if [ -n "${ov_kind}" ]; then
+            ov_kind_md="**${ov_kind}**
+          "
+            ov_kind_html="<p class=\"kindline\">${ov_kind}</p>"
+          fi
+          if [ "${have_inv}" != "true" ]; then
+            ov_kind_md="The repository profile was not produced for this scan, so there is
+          nothing to describe here. The Repository Posture job builds it and its
+          result was \`${R_POSTURE:-not run}\` — open that job for the cause.
+          "
+            ov_kind_html="<p class=\"sub\">The repository profile was not produced for this scan,
+          so there is nothing to describe here. The Repository Posture job builds it and its
+          result was <code>${R_POSTURE:-not run}</code> &mdash; open that job for the cause.</p>"
+          fi
+
+          sec_code_md="$(cat <<XEOF
           ## ${n_code}. What This Code Is
 
-          **${ov_kind}**
-
+          ${ov_kind_md}
           ${ov_readme_md}
           ${ov_fw_md}${ov_struct_md}${ov_entry_block_md}${ov_cmds_block_md}${ov_big_block_md}
           XEOF
           )"
-            sec_code_html="$(cat <<XEOF
+          sec_code_html="$(cat <<XEOF
           <section class="panel">
             <h2>${n_code}. What This Code Is</h2>
-            <p class="kindline">${ov_kind}</p>
+            ${ov_kind_html}
             ${ov_readme_html}
             ${ov_fw_html}${ov_struct_html}${ov_entry_block_html}${ov_cmds_block_html}${ov_big_block_html}
           </section>
           XEOF
           )"
+
+          sec_profile_md=""; sec_profile_html=""
+          if [ "${have_inv}" = "true" ]; then
             sec_profile_md="$(cat <<XEOF
           ## ${n_profile}. Repository & Code Profile
 
